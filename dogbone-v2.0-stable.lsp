@@ -1,20 +1,17 @@
 ;;; dogbone.lsp
 ;;; AutoCAD for Mac compatible AutoLISP dogbone helper.
-;;; Stable version: V2.1
+;;; Stable version: V2.0
 ;;;
 ;;; Commands:
 ;;;   DBSET   - Set tool diameter and whether contained hole outlines are handled.
 ;;;   DB1     - Draw A/B/C single-corner test geometry for review.
 ;;;   DBDEBUG - Draw debug markers for recognized dogbone corners.
-;;;   DBADD   - Add dogbones to selected sharp corners.
-;;;   DBRESTORE - Restore selected dogbones back to sharp corners.
-;;;   DBRESTOREALL - Restore all dogbones in selected polylines.
 ;;;   DBAUTO  - Rebuild selected closed LWPOLYLINE entities with C 45-degree dogbones.
 ;;;
 ;;; Production mode creates a new closed LWPOLYLINE and deletes the original
 ;;; only after the replacement entity is created successfully.
 
-(setq *db-version* "V2.1")
+(setq *db-version* "V2.0")
 (setq *db-tool-dia* 6.0)
 (setq *db-layer* "DOGBONE")
 (setq *db-process-holes* T)
@@ -24,7 +21,6 @@
 (setq *db-angle90-tol* 0.1)
 (setq *db-keep-original* nil)
 (setq *db-debug-mode* nil)
-(setq *db-restore-bulge-tol* 0.05)
 (setq *db-eps* 1.0e-8)
 
 (defun db:ensure-defaults ()
@@ -37,7 +33,6 @@
   (if (not *db-angle90-tol*) (setq *db-angle90-tol* 0.1))
   (if (not (boundp '*db-keep-original*)) (setq *db-keep-original* nil))
   (if (not (boundp '*db-debug-mode*)) (setq *db-debug-mode* nil))
-  (if (not *db-restore-bulge-tol*) (setq *db-restore-bulge-tol* 0.05))
   (if (not *db-eps*) (setq *db-eps* 1.0e-8))
 )
 
@@ -113,51 +108,8 @@
   (db:len (db:sub a b))
 )
 
-(defun db:pick-tolerance ()
-  (max 2.0 (* (db:radius) 2.0))
-)
-
 (defun db:pt2d (p)
   (list (float (car p)) (float (cadr p)))
-)
-
-(defun db:rect-from-points (a b)
-  (list
-    (min (db:x a) (db:x b))
-    (min (db:y a) (db:y b))
-    (max (db:x a) (db:x b))
-    (max (db:y a) (db:y b))
-  )
-)
-
-(defun db:point-in-rect (pt rect)
-  (and
-    (>= (db:x pt) (nth 0 rect))
-    (<= (db:x pt) (nth 2 rect))
-    (>= (db:y pt) (nth 1 rect))
-    (<= (db:y pt) (nth 3 rect))
-  )
-)
-
-(defun db:min-distance-to-points (pt pts / best p d)
-  (setq best nil)
-  (foreach p pts
-    (setq d (db:distance pt p))
-    (if (or (not best) (< d best))
-      (setq best d)
-    )
-  )
-  best
-)
-
-(defun db:list-has-int (value values / found v)
-  (setq found nil)
-  (foreach v values
-    (if (= value v)
-      (setq found T)
-    )
-  )
-  found
 )
 
 (defun db:assoc-value (key alist default / found)
@@ -821,37 +773,6 @@
   (list (reverse items) skipped-open skipped-bulge)
 )
 
-(defun db:collect-edit-selection (ss / i en ed data verts pts area items skipped-open layer color ltype lweight)
-  (setq i 0)
-  (setq items '())
-  (setq skipped-open 0)
-  (while (< i (sslength ss))
-    (setq en (ssname ss i))
-    (setq ed (entget en))
-    (setq data (db:lwpoly-data en))
-    (setq verts (cadr data))
-    (if (and (car data) (>= (length verts) 3))
-      (progn
-        (setq pts (db:vertex-points verts))
-        (setq area (db:poly-area pts))
-        (if (> (abs area) *db-eps*)
-          (progn
-            (setq layer (cdr (assoc 8 ed)))
-            (setq color (cdr (assoc 62 ed)))
-            (setq ltype (cdr (assoc 6 ed)))
-            (setq lweight (cdr (assoc 370 ed)))
-            (setq items (cons (list en pts area nil layer color ltype lweight verts) items))
-          )
-          (setq skipped-open (1+ skipped-open))
-        )
-      )
-      (setq skipped-open (1+ skipped-open))
-    )
-    (setq i (1+ i))
-  )
-  (list (reverse items) skipped-open)
-)
-
 (defun db:tag-holes (items / tagged i item is-hole)
   (setq tagged '())
   (setq i 0)
@@ -913,68 +834,6 @@
     )
   )
   found
-)
-
-(defun db:item-verts (item)
-  (nth 8 item)
-)
-
-(defun db:vertex-bulge (verts idx)
-  (cadr (nth idx verts))
-)
-
-(defun db:sharp-corner-p (verts idx / n prev-bulge this-bulge)
-  (setq n (length verts))
-  (setq prev-bulge (db:vertex-bulge verts (rem (+ idx n -1) n)))
-  (setq this-bulge (db:vertex-bulge verts idx))
-  (and
-    (<= (abs prev-bulge) *db-eps*)
-    (<= (abs this-bulge) *db-eps*)
-  )
-)
-
-(defun db:add-corner-match-p (pt rect)
-  (db:point-in-rect pt rect)
-)
-
-(defun db:build-add-patches (item rect existing / pts area is-hole verts n i p0 p1 p2 patch patches corners dupes)
-  (setq pts (cadr item))
-  (setq area (caddr item))
-  (setq is-hole (cadddr item))
-  (setq verts (db:item-verts item))
-  (setq n (length pts))
-  (setq i 0)
-  (setq patches '())
-  (setq corners 0)
-  (setq dupes 0)
-  (if (and is-hole (not *db-process-holes*))
-    (list '() 0 0)
-    (progn
-      (while (< i n)
-        (setq p0 (nth (rem (+ i n -1) n) pts))
-        (setq p1 (nth i pts))
-        (setq p2 (nth (rem (1+ i) n) pts))
-        (if (and
-              (db:sharp-corner-p verts i)
-              (db:needs-dogbone p0 p1 p2 area is-hole)
-              (db:add-corner-match-p p1 rect)
-            )
-          (progn
-            (setq corners (1+ corners))
-            (setq patch (db:create-patch p0 p1 p2 i))
-            (if patch
-              (if (db:duplicate-patch-p patch (append existing patches) *db-duplicate-tol*)
-                (setq dupes (1+ dupes))
-                (setq patches (cons patch patches))
-              )
-            )
-          )
-        )
-        (setq i (1+ i))
-      )
-      (list (reverse patches) corners dupes)
-    )
-  )
 )
 
 (defun db:duplicate-patch-p (patch patches tol / dup p)
@@ -1071,172 +930,6 @@
   )
 )
 
-(defun db:rebuild-edit-polyline-add (item patches / verts layer color ltype lweight n i patch vertices)
-  (setq verts (db:item-verts item))
-  (setq layer (nth 4 item))
-  (if (not layer) (setq layer "0"))
-  (setq color (nth 5 item))
-  (setq ltype (nth 6 item))
-  (setq lweight (nth 7 item))
-  (setq n (length verts))
-  (setq i 0)
-  (setq vertices '())
-  (while (< i n)
-    (setq patch (db:find-patch i patches))
-    (if patch
-      (setq vertices
-        (append
-          vertices
-          (list
-            (list (cdr (assoc 'start patch)) (cdr (assoc 'bulge patch)))
-            (list (cdr (assoc 'end patch)) 0.0)
-          )
-        )
-      )
-      (setq vertices
-        (append vertices (list (list (car (nth i verts)) (cadr (nth i verts)))))
-      )
-    )
-    (setq i (1+ i))
-  )
-  (if (>= (length vertices) 3)
-    (db:make-lwpolyline layer color ltype lweight vertices)
-    nil
-  )
-)
-
-(defun db:dogbone-bulge-p (bulge)
-  (<= (abs (- (abs bulge) 1.0)) *db-restore-bulge-tol*)
-)
-
-(defun db:restore-candidate (verts idx / n start end bulge chord len mid left sign radius corner)
-  (setq n (length verts))
-  (setq start (car (nth idx verts)))
-  (setq end (car (nth (rem (1+ idx) n) verts)))
-  (setq bulge (cadr (nth idx verts)))
-  (if (and (db:dogbone-bulge-p bulge) (> (db:distance start end) *db-eps*))
-    (progn
-      (setq chord (db:sub end start))
-      (setq len (db:len chord))
-      (setq mid (db:mul (db:add start end) 0.5))
-      (setq left (list (- (/ (db:y chord) len)) (/ (db:x chord) len) 0.0))
-      (setq sign (if (> bulge 0.0) 1.0 -1.0))
-      (setq radius (/ len 2.0))
-      (setq corner (db:add mid (db:mul left (* -1.0 sign radius))))
-      (list
-        (cons 'source-index idx)
-        (cons 'start start)
-        (cons 'end end)
-        (cons 'center mid)
-        (cons 'corner corner)
-        (cons 'midpoint corner)
-        (cons 'radius radius)
-        (cons 'bulge bulge)
-      )
-    )
-    nil
-  )
-)
-
-(defun db:restore-candidate-match-p (cand rect)
-  (or
-    (db:point-in-rect (cdr (assoc 'corner cand)) rect)
-    (db:point-in-rect (cdr (assoc 'center cand)) rect)
-    (db:point-in-rect (cdr (assoc 'midpoint cand)) rect)
-  )
-)
-
-(defun db:find-restore-candidate (idx candidates / found c)
-  (setq found nil)
-  (foreach c candidates
-    (if (= idx (cdr (assoc 'source-index c)))
-      (setq found c)
-    )
-  )
-  found
-)
-
-(defun db:build-restore-candidates (item rect / verts n i cand selected matched)
-  (setq verts (db:item-verts item))
-  (setq n (length verts))
-  (setq i 0)
-  (setq selected '())
-  (setq matched 0)
-  (while (< i n)
-    (setq cand (db:restore-candidate verts i))
-    (if (and cand (db:restore-candidate-match-p cand rect))
-      (progn
-        (setq selected (cons cand selected))
-        (setq matched (1+ matched))
-      )
-    )
-    (setq i (1+ i))
-  )
-  (list (reverse selected) matched)
-)
-
-(defun db:build-all-restore-candidates (item / verts n i cand selected matched)
-  (setq verts (db:item-verts item))
-  (setq n (length verts))
-  (setq i 0)
-  (setq selected '())
-  (setq matched 0)
-  (while (< i n)
-    (setq cand (db:restore-candidate verts i))
-    (if cand
-      (progn
-        (setq selected (cons cand selected))
-        (setq matched (1+ matched))
-      )
-    )
-    (setq i (1+ i))
-  )
-  (list (reverse selected) matched)
-)
-
-(defun db:rebuild-restore (item candidates / verts layer color ltype lweight n i cand vertices skip skip0)
-  (setq verts (db:item-verts item))
-  (setq layer (nth 4 item))
-  (if (not layer) (setq layer "0"))
-  (setq color (nth 5 item))
-  (setq ltype (nth 6 item))
-  (setq lweight (nth 7 item))
-  (setq n (length verts))
-  (setq i 0)
-  (setq vertices '())
-  (setq skip '())
-  (setq skip0 (if (db:find-restore-candidate (- n 1) candidates) T nil))
-  (while (< i n)
-    (cond
-      ((and (= i 0) skip0)
-        nil
-      )
-      ((db:list-has-int i skip)
-        nil
-      )
-      ((setq cand (db:find-restore-candidate i candidates))
-        (setq vertices
-          (append vertices (list (list (cdr (assoc 'corner cand)) 0.0)))
-        )
-        (if (= i (- n 1))
-          (setq skip (cons 0 skip))
-          (setq skip (cons (1+ i) skip))
-        )
-      )
-      (T
-        (setq vertices
-          (append vertices (list (list (car (nth i verts)) (cadr (nth i verts)))))
-        )
-      )
-    )
-    (setq i (1+ i))
-  )
-  (if (>= (length vertices) 3)
-    (db:make-lwpolyline layer color ltype lweight vertices)
-    nil
-  )
-)
-
 (defun db:ensure-debug-layers ()
   (db:ensure-named-layer "DBDEBUG_CORNER" 1)
   (db:ensure-named-layer "DBDEBUG_CENTER" 5)
@@ -1264,244 +957,6 @@
   (db:make-line-on-layer "DBDEBUG_DIRECTION" corner end)
   (db:make-circle-on-layer "DBDEBUG_CIRCLE" center radius)
   (db:make-text-on-layer "DBDEBUG_TEXT" textpt (* radius 0.35) label)
-)
-
-(defun db:get-edit-window (/ p1 p2)
-  (setq p1 (getpoint "\nFirst window corner around target corner(s): "))
-  (if p1
-    (progn
-      (setq p2 (getcorner p1 "\nOpposite window corner: "))
-      (if p2
-        (db:rect-from-points (db:pt2 p1) (db:pt2 p2))
-        nil
-      )
-    )
-    nil
-  )
-)
-
-(defun c:DBADD (/ olderr ss rect collected items skipped-open tagged
-                  item result patches all-patches poly-count hole-count corner-count
-                  dogbone-count duplicate-count rebuilt-count newent)
-  (db:ensure-defaults)
-  (setq olderr *error*)
-  (defun *error* (msg)
-    (db:end-undo)
-    (setq *error* olderr)
-    (if (and msg (/= msg "Function cancelled"))
-      (prompt (strcat "\nError: " msg))
-    )
-    (princ)
-  )
-  (prompt "\nSelect closed LWPOLYLINE outlines to add local dogbones.")
-  (setq ss (ssget '((0 . "LWPOLYLINE"))))
-  (if ss
-    (progn
-      (setq rect (db:get-edit-window))
-      (if rect
-        (progn
-          (db:start-undo)
-          (setq collected (db:collect-edit-selection ss))
-          (setq items (car collected))
-          (setq skipped-open (cadr collected))
-          (setq tagged (db:tag-holes items))
-          (setq poly-count (length tagged))
-          (setq hole-count 0)
-          (setq corner-count 0)
-          (setq dogbone-count 0)
-          (setq duplicate-count 0)
-          (setq rebuilt-count 0)
-          (setq all-patches '())
-          (foreach item tagged
-            (if (cadddr item) (setq hole-count (1+ hole-count)))
-            (setq result (db:build-add-patches item rect all-patches))
-            (setq patches (car result))
-            (setq all-patches (append all-patches patches))
-            (setq corner-count (+ corner-count (cadr result)))
-            (setq dogbone-count (+ dogbone-count (length patches)))
-            (setq duplicate-count (+ duplicate-count (caddr result)))
-            (if patches
-              (progn
-                (setq newent (db:rebuild-edit-polyline-add item patches))
-                (if newent
-                  (progn
-                    (setq rebuilt-count (1+ rebuilt-count))
-                    (entdel (car item))
-                  )
-                )
-              )
-            )
-          )
-          (db:end-undo)
-          (prompt
-            (strcat
-              "\nDBADD complete. Selected="
-              (itoa (sslength ss))
-              ", valid="
-              (itoa poly-count)
-              ", skipped="
-              (itoa skipped-open)
-              ", holes="
-              (itoa hole-count)
-              ", matched corners="
-              (itoa corner-count)
-              ", dogbones added="
-              (itoa dogbone-count)
-              ", duplicates skipped="
-              (itoa duplicate-count)
-              ", rebuilt polylines="
-              (itoa rebuilt-count)
-              "."
-            )
-          )
-        )
-        (prompt "\nDBADD cancelled.")
-      )
-    )
-    (prompt "\nNothing selected.")
-  )
-  (setq *error* olderr)
-  (princ)
-)
-
-(defun c:DBRESTORE (/ olderr ss rect collected items skipped-open tagged
-                      item result candidates poly-count restored-count matched-count rebuilt-count newent)
-  (db:ensure-defaults)
-  (setq olderr *error*)
-  (defun *error* (msg)
-    (db:end-undo)
-    (setq *error* olderr)
-    (if (and msg (/= msg "Function cancelled"))
-      (prompt (strcat "\nError: " msg))
-    )
-    (princ)
-  )
-  (prompt "\nSelect closed LWPOLYLINE outlines to restore dogbone corners.")
-  (setq ss (ssget '((0 . "LWPOLYLINE"))))
-  (if ss
-    (progn
-      (setq rect (db:get-edit-window))
-      (if rect
-        (progn
-          (db:start-undo)
-          (setq collected (db:collect-edit-selection ss))
-          (setq items (car collected))
-          (setq skipped-open (cadr collected))
-          (setq tagged (db:tag-holes items))
-          (setq poly-count (length tagged))
-          (setq matched-count 0)
-          (setq restored-count 0)
-          (setq rebuilt-count 0)
-          (foreach item tagged
-            (setq result (db:build-restore-candidates item rect))
-            (setq candidates (car result))
-            (setq matched-count (+ matched-count (cadr result)))
-            (setq restored-count (+ restored-count (length candidates)))
-            (if candidates
-              (progn
-                (setq newent (db:rebuild-restore item candidates))
-                (if newent
-                  (progn
-                    (setq rebuilt-count (1+ rebuilt-count))
-                    (entdel (car item))
-                  )
-                )
-              )
-            )
-          )
-          (db:end-undo)
-          (prompt
-            (strcat
-              "\nDBRESTORE complete. Selected="
-              (itoa (sslength ss))
-              ", valid="
-              (itoa poly-count)
-              ", skipped="
-              (itoa skipped-open)
-              ", matched dogbones="
-              (itoa matched-count)
-              ", restored dogbones="
-              (itoa restored-count)
-              ", rebuilt polylines="
-              (itoa rebuilt-count)
-              "."
-            )
-          )
-        )
-        (prompt "\nDBRESTORE cancelled.")
-      )
-    )
-    (prompt "\nNothing selected.")
-  )
-  (setq *error* olderr)
-  (princ)
-)
-
-(defun c:DBRESTOREALL (/ olderr ss collected items skipped-open tagged
-                         item result candidates poly-count restored-count matched-count rebuilt-count newent)
-  (db:ensure-defaults)
-  (setq olderr *error*)
-  (defun *error* (msg)
-    (db:end-undo)
-    (setq *error* olderr)
-    (if (and msg (/= msg "Function cancelled"))
-      (prompt (strcat "\nError: " msg))
-    )
-    (princ)
-  )
-  (prompt "\nSelect closed LWPOLYLINE outlines to restore all dogbone corners.")
-  (setq ss (ssget '((0 . "LWPOLYLINE"))))
-  (if ss
-    (progn
-      (db:start-undo)
-      (setq collected (db:collect-edit-selection ss))
-      (setq items (car collected))
-      (setq skipped-open (cadr collected))
-      (setq tagged (db:tag-holes items))
-      (setq poly-count (length tagged))
-      (setq matched-count 0)
-      (setq restored-count 0)
-      (setq rebuilt-count 0)
-      (foreach item tagged
-        (setq result (db:build-all-restore-candidates item))
-        (setq candidates (car result))
-        (setq matched-count (+ matched-count (cadr result)))
-        (setq restored-count (+ restored-count (length candidates)))
-        (if candidates
-          (progn
-            (setq newent (db:rebuild-restore item candidates))
-            (if newent
-              (progn
-                (setq rebuilt-count (1+ rebuilt-count))
-                (entdel (car item))
-              )
-            )
-          )
-        )
-      )
-      (db:end-undo)
-      (prompt
-        (strcat
-          "\nDBRESTOREALL complete. Selected="
-          (itoa (sslength ss))
-          ", valid="
-          (itoa poly-count)
-          ", skipped="
-          (itoa skipped-open)
-          ", matched dogbones="
-          (itoa matched-count)
-          ", restored dogbones="
-          (itoa restored-count)
-          ", rebuilt polylines="
-          (itoa rebuilt-count)
-          "."
-        )
-      )
-    )
-    (prompt "\nNothing selected.")
-  )
-  (setq *error* olderr)
-  (princ)
 )
 
 (defun c:DBDEBUG (/ olderr ss collected items skipped-open skipped-bulge tagged
@@ -1671,5 +1126,5 @@
   (princ)
 )
 
-(prompt (strcat "\nDogbone plugin " *db-version* " loaded. Commands: DBSET, DB1, DBDEBUG, DBAUTO, DBADD, DBRESTORE, DBRESTOREALL."))
+(prompt (strcat "\nDogbone plugin " *db-version* " loaded. Commands: DBSET, DB1, DBDEBUG, DBAUTO."))
 (princ)
