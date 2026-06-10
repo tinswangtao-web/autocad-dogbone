@@ -1,6 +1,6 @@
 # AutoCAD for Mac Dogbone AutoLISP Plugin
 
-当前主文件 `dogbone.lsp` 是 `V2.1` 稳定版。
+当前主文件 `dogbone.lsp` 是 `V2.1-Nest` 版本。
 
 `dogbone-v2.0-stable.lsp` 保留为 V2.0 备份版本。
 
@@ -17,7 +17,7 @@
 1. 在 AutoCAD for Mac 中打开图纸。
 2. 输入 `APPLOAD`。
 3. 选择本文件夹里的 `dogbone.lsp`。
-4. 命令行出现 `Dogbone plugin V2.1 loaded. Commands: DBSET, DB1, DBDEBUG, DBAUTO, DBADD, DBRESTORE, DBRESTOREALL.` 后即可使用。
+4. 命令行出现 `Dogbone plugin V2.1-Nest loaded. Commands: DBSET, DB1, DBDEBUG, DBAUTO, DBADD, DBRESTORE, DBRESTOREALL, DBNSET, DBNEST.` 后即可使用。
 
 ## 命令
 
@@ -120,6 +120,34 @@ DBSET 设置新的刀具直径
 DBADD 或 DBAUTO 重新生成 dogbone
 ```
 
+### DBNSET
+
+设置排料（Nesting）间距参数。
+
+- 输入新的间距值（单位与图纸一致，通常为 mm）。
+- 直接回车保持当前值。
+- 默认间距为 `6.0`。
+
+### DBNEST
+
+排料命令。将选中的零件按间距排进一个矩形板框内。
+
+流程：
+
+1. 选择要排料的零件（支持 `LWPOLYLINE` 和 `INSERT` 块参照）。
+2. 点选一个矩形闭合多段线作为板框（必须是 4 顶点闭合 LWPOLYLINE）。
+3. 插件自动按面积从大到小排序，使用层架（Shelf）算法排布。
+4. 排得下的零件移入板框，排不下的留在原位。
+5. 命令行显示统计：共几个零件、排入几个、剩余几个。
+6. 支持 `UNDO` 一步撤销。
+
+排料使用流程：
+
+```text
+DBNSET       可选，先设置零件间距
+DBNEST       选择零件 → 选择板框 → 自动排布
+```
+
 ## 几何规则
 
 对每个顶点取：
@@ -146,11 +174,13 @@ DBADD 或 DBAUTO 重新生成 dogbone
 - 使用绿色参考圆中靠近原角点的那一段圆弧重建 polyline。
 - 对 90° C 型 dogbone，这段圆弧是半圆，bulge 绝对值为 `1.0`。
 
-## V2.1 限制
+## V2.1-Nest 限制
 
 - 仅支持闭合 `LWPOLYLINE`。
 - 仅处理直线段。
 - 不处理普通 `POLYLINE`、样条曲线、圆弧段。
 - 成功生成新闭合 polyline 后，默认删除原始 polyline。
-- 孔洞识别基于“所选多段线之间的包含关系”。建议批量处理时同时选择外轮廓和内部孔洞轮廓。
+- 孔洞识别基于"所选多段线之间的包含关系"。建议批量处理时同时选择外轮廓和内部孔洞轮廓。
 - `DBRESTORE` 当前主要面向 V2.0/V2.1 生成的 90° C 型 dogbone 半圆。
+- 排料算法为简单层架（Shelf）排布，不做旋转优化。
+- 排料仅基于 AABB 包围盒，不考虑零件实际轮廓的嵌套。

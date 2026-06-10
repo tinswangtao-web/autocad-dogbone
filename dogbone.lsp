@@ -10,11 +10,13 @@
 ;;;   DBRESTORE - Restore selected dogbones back to sharp corners.
 ;;;   DBRESTOREALL - Restore all dogbones in selected polylines.
 ;;;   DBAUTO  - Rebuild selected closed LWPOLYLINE entities with C 45-degree dogbones.
+;;;   DBNSET  - Set nesting gap (minimum spacing between parts, default 6 mm).
+;;;   DBNEST  - Pack selected parts into a rectangular sheet using Shelf algorithm.
 ;;;
 ;;; Production mode creates a new closed LWPOLYLINE and deletes the original
 ;;; only after the replacement entity is created successfully.
 
-(setq *db-version* "V2.1")
+(setq *db-version* "V2.1-Nest")
 (setq *db-tool-dia* 6.0)
 (setq *db-layer* "DOGBONE")
 (setq *db-process-holes* T)
@@ -26,6 +28,7 @@
 (setq *db-debug-mode* nil)
 (setq *db-restore-bulge-tol* 0.05)
 (setq *db-eps* 1.0e-8)
+(setq *db-nest-gap* 6.0)
 
 (defun db:ensure-defaults ()
   (if (not *db-tool-dia*) (setq *db-tool-dia* 6.0))
@@ -1671,5 +1674,482 @@
   (princ)
 )
 
-(prompt (strcat "\nDogbone plugin " *db-version* " loaded. Commands: DBSET, DB1, DBDEBUG, DBAUTO, DBADD, DBRESTORE, DBRESTOREALL."))
+;;; =========================================================================
+;;; NESTING / PACKING MODULE  (V2.1-Nest)
+;;; =========================================================================
+;;; Arranges selected LWPOLYLINE / INSERT parts into a rectangular sheet
+;;; using a simple shelf (layer) packing algorithm.
+;;; New commands: DBNSET (set gap), DBNEST (run nesting).
+;;; =========================================================================
+
+;;; ---------------------------------------------------------------------------
+;;; db:lwpoly-bbox  —  AABB for a LWPOLYLINE entity
+;;; Returns (min-x min-y max-x max-y) or nil
+;;; ---------------------------------------------------------------------------
+(defun db:lwpoly-bbox (ename / data verts pts p minx miny maxx maxy)
+  (setq data (db:lwpoly-data ename))
+  (setq verts (cadr data))
+  (if (null verts)
+    nil
+    (progn
+      (setq pts (db:vertex-points verts))
+      (setq p (car pts))
+      (setq minx (db:x p))
+      (setq miny (db:y p))
+      (setq maxx minx)
+      (setq maxy miny)
+      (foreach p (cdr pts)
+        (if (< (db:x p) minx) (setq minx (db:x p)))
+        (if (< (db:y p) miny) (setq miny (db:y p)))
+        (if (> (db:x p) maxx) (setq maxx (db:x p)))
+        (if (> (db:y p) maxy) (setq maxy (db:y p)))
+      )
+      (list minx miny maxx maxy)
+    )
+  )
+)
+
+;;; ---------------------------------------------------------------------------
+;;; db:insert-collect-pts  —  Recursively collect world-coordinate points
+;;; from all LWPOLYLINE entities inside a block definition.
+;;; sx, sy  = accumulated X/Y scale
+;;; rot     = accumulated rotation (radians)
+;;; insx, insy = accumulated insertion point offset
+;;; ---------------------------------------------------------------------------
+(defun db:insert-collect-pts (blockname sx sy rot insx insy
+                              / bdef sub-en ed etype allpts
+                                sub-bn sub-ins sub-sx sub-sy sub-rot
+                                data verts v px py rx ry cos-r sin-r
+                                nested-pts)
+  (setq bdef (tblsearch "BLOCK" blockname))
+  (if (not bdef)
+    nil
+    (progn
+      (setq sub-en (cdr (assoc -2 bdef)))
+      (setq allpts '())
+      (setq cos-r (cos rot))
+      (setq sin-r (sin rot))
+      (while sub-en
+        (setq ed (entget sub-en))
+        (setq etype (cdr (assoc 0 ed)))
+        (cond
+          ;; LWPOLYLINE inside block: collect its vertices
+          ((= etype "LWPOLYLINE")
+            (setq data (db:lwpoly-data sub-en))
+            (setq verts (cadr data))
+            (foreach v verts
+              (setq px (* (db:x (car v)) sx))
+              (setq py (* (db:y (car v)) sy))
+              ;; rotate
+              (setq rx (- (* px cos-r) (* py sin-r)))
+              (setq ry (+ (* px sin-r) (* py cos-r)))
+              ;; translate
+              (setq allpts (cons (list (+ rx insx) (+ ry insy) 0.0) allpts))
+            )
+          )
+          ;; Nested INSERT: recurse
+          ((= etype "INSERT")
+            (setq sub-bn (cdr (assoc 2 ed)))
+            (setq sub-ins (cdr (assoc 10 ed)))
+            (setq sub-sx (cdr (assoc 41 ed)))
+            (setq sub-sy (cdr (assoc 42 ed)))
+            (setq sub-rot (cdr (assoc 50 ed)))
+            (if (not sub-sx) (setq sub-sx 1.0))
+            (if (not sub-sy) (setq sub-sy 1.0))
+            (if (not sub-rot) (setq sub-rot 0.0))
+            ;; The nested INSERT's local coords must be transformed through
+            ;; the parent's scale+rotation first.
+            (setq nested-pts
+              (db:insert-collect-pts
+                sub-bn
+                (* sx sub-sx)
+                (* sy sub-sy)
+                (+ rot sub-rot)
+                ;; Translate the nested insertion point through parent transform
+                (+ insx
+                   (- (* (* (db:x sub-ins) sx) cos-r)
+                      (* (* (db:y sub-ins) sy) sin-r)))
+                (+ insy
+                   (+ (* (* (db:x sub-ins) sx) sin-r)
+                      (* (* (db:y sub-ins) sy) cos-r)))
+              )
+            )
+            (if nested-pts
+              (setq allpts (append allpts nested-pts))
+            )
+          )
+        )
+        (setq sub-en (entnext sub-en))
+      )
+      allpts
+    )
+  )
+)
+
+;;; ---------------------------------------------------------------------------
+;;; db:insert-bbox  —  AABB for an INSERT (block reference) entity
+;;; Returns (min-x min-y max-x max-y) or nil
+;;; ---------------------------------------------------------------------------
+(defun db:insert-bbox (ename / ed blockname ins sx sy rot pts p minx miny maxx maxy)
+  (setq ed (entget ename))
+  (setq blockname (cdr (assoc 2 ed)))
+  (setq ins (cdr (assoc 10 ed)))
+  (setq sx (cdr (assoc 41 ed)))
+  (setq sy (cdr (assoc 42 ed)))
+  (setq rot (cdr (assoc 50 ed)))
+  (if (not sx) (setq sx 1.0))
+  (if (not sy) (setq sy 1.0))
+  (if (not rot) (setq rot 0.0))
+  (setq pts (db:insert-collect-pts blockname sx sy rot (db:x ins) (db:y ins)))
+  (if (or (not pts) (null pts))
+    (progn
+      (prompt (strcat "\n警告: 块 \"" blockname "\" 内未找到 LWPOLYLINE，跳过。"))
+      nil
+    )
+    (progn
+      (setq p (car pts))
+      (setq minx (db:x p))
+      (setq miny (db:y p))
+      (setq maxx minx)
+      (setq maxy miny)
+      (foreach p (cdr pts)
+        (if (< (db:x p) minx) (setq minx (db:x p)))
+        (if (< (db:y p) miny) (setq miny (db:y p)))
+        (if (> (db:x p) maxx) (setq maxx (db:x p)))
+        (if (> (db:y p) maxy) (setq maxy (db:y p)))
+      )
+      (list minx miny maxx maxy)
+    )
+  )
+)
+
+;;; ---------------------------------------------------------------------------
+;;; AABB helper accessors
+;;; ---------------------------------------------------------------------------
+(defun db:bbox-width (bbox)
+  (- (nth 2 bbox) (nth 0 bbox))
+)
+
+(defun db:bbox-height (bbox)
+  (- (nth 3 bbox) (nth 1 bbox))
+)
+
+(defun db:bbox-area (bbox)
+  (* (db:bbox-width bbox) (db:bbox-height bbox))
+)
+
+;;; ---------------------------------------------------------------------------
+;;; db:entity-aabb  —  Unified AABB entry point
+;;; ---------------------------------------------------------------------------
+(defun db:entity-aabb (ename / ed etype)
+  (setq ed (entget ename))
+  (setq etype (cdr (assoc 0 ed)))
+  (cond
+    ((= etype "LWPOLYLINE") (db:lwpoly-bbox ename))
+    ((= etype "INSERT")     (db:insert-bbox ename))
+    (T nil)
+  )
+)
+
+;;; ---------------------------------------------------------------------------
+;;; db:collect-nest-parts  —  Prompt user to select parts and compute AABBs
+;;; Returns list of (ename bbox width height area entity-type)
+;;; ---------------------------------------------------------------------------
+(defun db:collect-nest-parts (/ ss i n en bbox w h a etype parts)
+  (prompt "\n选择要排料的零件 (LWPOLYLINE 或 INSERT): ")
+  (setq ss (ssget '((0 . "LWPOLYLINE,INSERT"))))
+  (if (not ss)
+    nil
+    (progn
+      (setq parts '())
+      (setq i 0)
+      (setq n (sslength ss))
+      (while (< i n)
+        (setq en (ssname ss i))
+        (setq bbox (db:entity-aabb en))
+        (if bbox
+          (progn
+            (setq w (db:bbox-width bbox))
+            (setq h (db:bbox-height bbox))
+            (setq a (db:bbox-area bbox))
+            (setq etype (cdr (assoc 0 (entget en))))
+            (setq parts (cons (list en bbox w h a etype) parts))
+          )
+          (prompt (strcat "\n警告: 第 " (itoa (1+ i)) " 个实体无法计算 AABB，已跳过。"))
+        )
+        (setq i (1+ i))
+      )
+      (reverse parts)
+    )
+  )
+)
+
+;;; ---------------------------------------------------------------------------
+;;; db:select-sheet  —  Prompt user to pick a rectangular sheet boundary
+;;; Returns the AABB (min-x min-y max-x max-y) or nil
+;;; ---------------------------------------------------------------------------
+(defun db:select-sheet (/ sel en ed etype data verts pts n closed bbox)
+  (setq sel (entsel "\n请选择板框 (矩形闭合多段线): "))
+  (if (not sel)
+    (progn
+      (prompt "\n未选择板框。")
+      nil
+    )
+    (progn
+      (setq en (car sel))
+      (setq ed (entget en))
+      (setq etype (cdr (assoc 0 ed)))
+      (if (/= etype "LWPOLYLINE")
+        (progn
+          (prompt "\n错误: 选择的不是 LWPOLYLINE。")
+          nil
+        )
+        (progn
+          (setq data (db:lwpoly-data en))
+          (setq closed (car data))
+          (setq verts (cadr data))
+          (setq n (length verts))
+          (if (not closed)
+            (progn
+              (prompt "\n错误: 板框必须是闭合多段线。")
+              nil
+            )
+            (if (/= n 4)
+              (progn
+                (prompt (strcat "\n错误: 板框必须是 4 个顶点的矩形，当前有 " (itoa n) " 个顶点。"))
+                nil
+              )
+              (progn
+                (setq bbox (db:lwpoly-bbox en))
+                (prompt
+                  (strcat
+                    "\n板框尺寸: "
+                    (rtos (db:bbox-width bbox) 2 2)
+                    " x "
+                    (rtos (db:bbox-height bbox) 2 2)
+                  )
+                )
+                bbox
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;;; ---------------------------------------------------------------------------
+;;; db:sort-by-area-desc  —  Sort parts by area (5th element) descending
+;;; Simple insertion sort for AutoLISP compatibility
+;;; ---------------------------------------------------------------------------
+(defun db:sort-by-area-desc (parts / sorted rest item inserted tmp result)
+  (setq sorted '())
+  (setq rest parts)
+  (while rest
+    (setq item (car rest))
+    (setq rest (cdr rest))
+    ;; Insert item into sorted list at the correct position
+    (setq inserted nil)
+    (setq tmp '())
+    (setq result '())
+    (setq tmp sorted)
+    (while (and tmp (not inserted))
+      (if (>= (nth 4 (car tmp)) (nth 4 item))
+        (progn
+          (setq result (cons (car tmp) result))
+          (setq tmp (cdr tmp))
+        )
+        (setq inserted T)
+      )
+    )
+    (setq result (cons item result))
+    (while tmp
+      (setq result (cons (car tmp) result))
+      (setq tmp (cdr tmp))
+    )
+    (setq sorted (reverse result))
+  )
+  sorted
+)
+
+;;; ---------------------------------------------------------------------------
+;;; db:shelf-pack  —  Shelf (layer) packing algorithm
+;;; parts      = list of (ename bbox width height area entity-type)
+;;; sheet-bbox = (min-x min-y max-x max-y)
+;;; gap        = minimum spacing between parts
+;;;
+;;; Parts can touch the sheet edges (no inset). Gap is only between parts.
+;;;
+;;; Returns list of (ename target-x target-y placed)
+;;;   placed = T or nil
+;;; ---------------------------------------------------------------------------
+(defun db:shelf-pack (parts sheet-bbox gap
+                      / sheet-minx sheet-miny sheet-w sheet-h
+                        shelf-x shelf-y shelf-h
+                        results part pw ph tx ty placed first-in-row)
+  (setq sheet-minx (nth 0 sheet-bbox))
+  (setq sheet-miny (nth 1 sheet-bbox))
+  (setq sheet-w (db:bbox-width sheet-bbox))
+  (setq sheet-h (db:bbox-height sheet-bbox))
+  (setq shelf-x 0.0)
+  (setq shelf-y 0.0)
+  (setq shelf-h 0.0)
+  (setq results '())
+  (setq first-in-row T)
+  (foreach part parts
+    (setq pw (nth 2 part))  ; width
+    (setq ph (nth 3 part))  ; height
+    (setq placed nil)
+    ;; Check if part fits in the sheet at all
+    (if (and (<= pw (+ sheet-w *db-eps*))
+             (<= ph (+ sheet-h *db-eps*)))
+      (progn
+        ;; Check if part fits in current row
+        ;; If not first in row, we need gap before this part
+        (if (and (not first-in-row)
+                 (> (+ shelf-x gap pw) (+ sheet-w *db-eps*)))
+          ;; Need new row
+          (progn
+            (setq shelf-y (+ shelf-y shelf-h gap))
+            (setq shelf-x 0.0)
+            (setq shelf-h 0.0)
+            (setq first-in-row T)
+          )
+        )
+        ;; If first in row, check width directly (no gap prefix)
+        (if (and first-in-row
+                 (> pw (+ sheet-w *db-eps*)))
+          nil  ;; part too wide, can't place
+          (progn
+            ;; Check vertical fit
+            (if (<= (+ shelf-y ph) (+ sheet-h *db-eps*))
+              (progn
+                (setq tx (+ sheet-minx shelf-x))
+                (setq ty (+ sheet-miny shelf-y))
+                (setq placed T)
+                ;; Update shelf tracking
+                (if (> ph shelf-h) (setq shelf-h ph))
+                (if first-in-row
+                  (progn
+                    (setq shelf-x (+ shelf-x pw))
+                    (setq first-in-row nil)
+                  )
+                  (setq shelf-x (+ shelf-x gap pw))
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+    (if (not placed)
+      (setq tx 0.0 ty 0.0)
+    )
+    (setq results (cons (list (car part) tx ty placed) results))
+  )
+  (reverse results)
+)
+
+;;; ---------------------------------------------------------------------------
+;;; db:move-entity-to  —  Move an entity from one point to another
+;;; ---------------------------------------------------------------------------
+(defun db:move-entity-to (ename from-pt to-pt)
+  (command "_.MOVE" ename "" from-pt to-pt)
+)
+
+;;; ---------------------------------------------------------------------------
+;;; c:DBNSET  —  Set nesting gap parameter
+;;; ---------------------------------------------------------------------------
+(defun c:DBNSET (/ g)
+  (prompt (strcat "\n当前排料间距: " (rtos *db-nest-gap* 2 2) " mm"))
+  (setq g (getreal (strcat "\n输入新的排料间距 <" (rtos *db-nest-gap* 2 2) ">: ")))
+  (if (and g (>= g 0.0))
+    (setq *db-nest-gap* g)
+  )
+  (prompt (strcat "\n排料间距已设为: " (rtos *db-nest-gap* 2 2) " mm"))
+  (princ)
+)
+
+;;; ---------------------------------------------------------------------------
+;;; c:DBNEST  —  Main nesting command
+;;; ---------------------------------------------------------------------------
+(defun c:DBNEST (/ olderr parts sheet-bbox sorted results
+                   total-count placed-count remain-count
+                   r en tx ty placed bbox from-pt to-pt)
+  (setq olderr *error*)
+  (defun *error* (msg)
+    (db:end-undo)
+    (setq *error* olderr)
+    (if (and msg (/= msg "Function cancelled"))
+      (prompt (strcat "\nError: " msg))
+    )
+    (princ)
+  )
+  (db:start-undo)
+  ;; Step 1: Collect parts
+  (setq parts (db:collect-nest-parts))
+  (if (or (not parts) (null parts))
+    (progn
+      (prompt "\n未选择任何有效零件。")
+      (db:end-undo)
+      (setq *error* olderr)
+      (princ)
+    )
+    (progn
+      ;; Step 2: Select sheet
+      (setq sheet-bbox (db:select-sheet))
+      (if (not sheet-bbox)
+        (progn
+          (prompt "\n板框选择失败，操作取消。")
+          (db:end-undo)
+          (setq *error* olderr)
+          (princ)
+        )
+        (progn
+          ;; Step 3: Sort by area descending
+          (setq sorted (db:sort-by-area-desc parts))
+          (prompt (strcat "\n开始排料... 零件数: " (itoa (length sorted))
+                          ", 间距: " (rtos *db-nest-gap* 2 2)))
+          ;; Step 4: Run shelf packing
+          (setq results (db:shelf-pack sorted sheet-bbox *db-nest-gap*))
+          ;; Step 5: Move placed parts
+          (setq total-count (length results))
+          (setq placed-count 0)
+          (setq remain-count 0)
+          (foreach r results
+            (setq en (car r))
+            (setq tx (cadr r))
+            (setq ty (caddr r))
+            (setq placed (cadddr r))
+            (if placed
+              (progn
+                (setq bbox (db:entity-aabb en))
+                (setq from-pt (list (nth 0 bbox) (nth 1 bbox) 0.0))
+                (setq to-pt (list tx ty 0.0))
+                (db:move-entity-to en from-pt to-pt)
+                (setq placed-count (1+ placed-count))
+              )
+              (setq remain-count (1+ remain-count))
+            )
+          )
+          ;; Step 6: Report
+          (prompt
+            (strcat
+              "\nDBNEST 完成。共 " (itoa total-count)
+              " 个零件，已排入 " (itoa placed-count)
+              " 个，剩余 " (itoa remain-count)
+              " 个未排入。"
+            )
+          )
+          (db:end-undo)
+          (setq *error* olderr)
+          (princ)
+        )
+      )
+    )
+  )
+)
+
+(prompt (strcat "\nDogbone plugin " *db-version* " loaded. Commands: DBSET, DB1, DBDEBUG, DBAUTO, DBADD, DBRESTORE, DBRESTOREALL, DBNSET, DBNEST."))
 (princ)
