@@ -1183,14 +1183,8 @@
   )
 )
 
-(defun db:rebuild-polyline (item patches / pts layer color ltype lweight owner n i patch vertices)
+(defun db:build-replacement-vertices (item patches / pts n i patch vertices)
   (setq pts (cadr item))
-  (setq layer (nth 4 item))
-  (if (not layer) (setq layer "0"))
-  (setq color (nth 5 item))
-  (setq ltype (nth 6 item))
-  (setq lweight (nth 7 item))
-  (setq owner (cdr (assoc 330 (entget (car item)))))
   (setq n (length pts))
   (setq i 0)
   (setq vertices '())
@@ -1212,10 +1206,67 @@
     )
     (setq i (1+ i))
   )
+  vertices
+)
+
+(defun db:rebuild-polyline-from-vertices (item vertices / layer color ltype lweight owner)
+  (setq layer (nth 4 item))
+  (if (not layer) (setq layer "0"))
+  (setq color (nth 5 item))
+  (setq ltype (nth 6 item))
+  (setq lweight (nth 7 item))
+  (setq owner (cdr (assoc 330 (entget (car item)))))
   (if (>= (length vertices) 3)
     (db:make-lwpolyline-owned owner layer color ltype lweight vertices)
     nil
   )
+)
+
+(defun db:rebuild-polyline (item patches)
+  (db:rebuild-polyline-from-vertices item (db:build-replacement-vertices item patches))
+)
+
+(defun db:lwpoly-vertex-code-p (code)
+  (or (= code 10) (= code 40) (= code 41) (= code 42) (= code 91))
+)
+
+(defun db:lwpoly-trailing-code-p (code)
+  (= code 210)
+)
+
+;;; Modify an existing LWPOLYLINE without changing its handle or owner. This is
+;;; required for block-definition entities: creating a replacement with entmakex
+;;; can place the result in model space instead of the original block definition.
+(defun db:update-lwpolyline-in-place (ename vertices / ed header trailing d modified v)
+  (setq ed (entget ename))
+  (setq header '())
+  (setq trailing '())
+  (foreach d ed
+    (cond
+      ((= (car d) 90)
+        (setq header (append header (list (cons 90 (length vertices)))))
+      )
+      ((db:lwpoly-vertex-code-p (car d)))
+      ((db:lwpoly-trailing-code-p (car d))
+        (setq trailing (append trailing (list d)))
+      )
+      (T (setq header (append header (list d))))
+    )
+  )
+  (setq modified header)
+  (foreach v vertices
+    (setq modified
+      (append
+        modified
+        (list
+          (cons 10 (db:pt2d (car v)))
+          (cons 42 (cadr v))
+        )
+      )
+    )
+  )
+  (setq modified (append modified trailing))
+  (entmod modified)
 )
 
 (defun db:rebuild-edit-polyline-add (item patches / verts layer color ltype lweight n i patch vertices)
@@ -1724,9 +1775,9 @@
   (princ)
 )
 
-(defun db:process-dbauto-group (items / tagged item result patch patches all-patches
+(defun db:process-dbauto-group (group-kind items / tagged item result patch patches all-patches
                                       poly-count hole-count corner-count dogbone-count
-                                      duplicate-count rebuilt-count newent)
+                                      duplicate-count rebuilt-count vertices newent)
   (setq tagged (db:tag-holes items))
   (setq poly-count (length tagged))
   (setq hole-count 0)
@@ -1748,12 +1799,16 @@
     )
     (if patches
       (progn
-        (setq newent (db:rebuild-polyline item patches))
-        (if newent
+        (setq vertices (db:build-replacement-vertices item patches))
+        (if (= group-kind 'block)
+          (setq newent (db:update-lwpolyline-in-place (car item) vertices))
           (progn
-            (setq rebuilt-count (1+ rebuilt-count))
-            (if (not *db-keep-original*) (entdel (car item)))
+            (setq newent (db:rebuild-polyline-from-vertices item vertices))
+            (if (and newent (not *db-keep-original*)) (entdel (car item)))
           )
+        )
+        (if newent
+          (setq rebuilt-count (1+ rebuilt-count))
         )
       )
     )
@@ -1801,7 +1856,7 @@
       (setq duplicate-count 0)
       (setq rebuilt-count 0)
       (foreach group groups
-        (setq stats (db:process-dbauto-group (nth 2 group)))
+        (setq stats (db:process-dbauto-group (car group) (nth 2 group)))
         (setq poly-count (+ poly-count (cdr (assoc 'valid stats))))
         (setq hole-count (+ hole-count (cdr (assoc 'holes stats))))
         (setq corner-count (+ corner-count (cdr (assoc 'corners stats))))

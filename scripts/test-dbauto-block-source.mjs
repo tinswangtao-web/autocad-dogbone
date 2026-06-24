@@ -57,12 +57,6 @@ assert.match(
 );
 
 assert.match(
-  dbauto,
-  /\(db:process-dbauto-group \(nth 2 group\)\)/,
-  "DBAUTO should process each block definition as an independent group",
-);
-
-assert.match(
   source,
   /\(setq owner \(cdr \(assoc 330 \(entget \(car item\)\)\)\)\)/,
   "Replacement polylines should preserve their source owner",
@@ -90,6 +84,12 @@ assert.match(
   source,
   /\(if \(= group-kind 'block\)[\s\S]*?\(db:update-lwpolyline-in-place/,
   "Block groups should update existing polylines in place",
+);
+
+assert.match(
+  source,
+  /\(if \(= group-kind 'block\)\s*\(setq newent \(db:update-lwpolyline-in-place[\s\S]*?\)\)\s*\(progn[\s\S]*?\(entdel \(car item\)\)/,
+  "Only the direct-polyline branch should create a replacement and delete its source",
 );
 
 function assertBalancedParens(text) {
