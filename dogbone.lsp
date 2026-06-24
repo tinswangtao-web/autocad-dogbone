@@ -9,7 +9,8 @@
 ;;;   DBADD   - Add dogbones to selected sharp corners.
 ;;;   DBRESTORE - Restore selected dogbones back to sharp corners.
 ;;;   DBRESTOREALL - Restore all dogbones in selected polylines.
-;;;   DBAUTO  - Rebuild selected closed LWPOLYLINE entities with C 45-degree dogbones.
+;;;   DBAUTO  - Rebuild selected closed LWPOLYLINE entities or 1:1 block definitions
+;;;             with C 45-degree dogbones.
 ;;;   DBNSET  - Set nesting gap (minimum spacing between parts, default 6 mm).
 ;;;   DBNEST  - Pack selected parts into a rectangular sheet with AABB nesting.
 ;;;   DBNESTM - Pack selected parts across copied sheet frames.
@@ -293,7 +294,7 @@
   )
 )
 
-(defun db:make-lwpolyline (layer color ltype lweight vertices / header data v)
+(defun db:make-lwpolyline-owned (owner layer color ltype lweight vertices / header data v)
   (setq header
     (list
       '(0 . "LWPOLYLINE")
@@ -301,6 +302,7 @@
       (cons 8 layer)
     )
   )
+  (if owner (setq header (append (list (car header) (cons 330 owner)) (cdr header))))
   (if color (setq header (append header (list (cons 62 color)))))
   (if ltype (setq header (append header (list (cons 6 ltype)))))
   (if lweight (setq header (append header (list (cons 370 lweight)))))
@@ -327,6 +329,10 @@
     )
   )
   (entmakex data)
+)
+
+(defun db:make-lwpolyline (layer color ltype lweight vertices)
+  (db:make-lwpolyline-owned nil layer color ltype lweight vertices)
 )
 
 (defun db:make-arc-on-layer (layer center radius start end ccw / a1 a2)
@@ -788,13 +794,11 @@
   (princ)
 )
 
-(defun db:collect-selection (ss / i en data ed verts pts area items skipped-open skipped-bulge layer color ltype lweight)
-  (setq i 0)
+(defun db:collect-entities (entities / en data ed verts pts area items skipped-open skipped-bulge layer color ltype lweight)
   (setq items '())
   (setq skipped-open 0)
   (setq skipped-bulge 0)
-  (while (< i (sslength ss))
-    (setq en (ssname ss i))
+  (foreach en entities
     (setq ed (entget en))
     (setq data (db:lwpoly-data en))
     (setq verts (cadr data))
@@ -823,9 +827,144 @@
         )
       )
     )
-    (setq i (1+ i))
   )
   (list (reverse items) skipped-open skipped-bulge)
+)
+
+(defun db:collect-selection (ss / i entities)
+  (setq i 0)
+  (setq entities '())
+  (while (< i (sslength ss))
+    (setq entities (cons (ssname ss i) entities))
+    (setq i (1+ i))
+  )
+  (db:collect-entities (reverse entities))
+)
+
+(defun db:near-one-p (value)
+  (<= (abs (- (float value) 1.0)) *db-eps*)
+)
+
+(defun db:unit-scale-insert-p (ed / sx sy sz)
+  (setq sx (db:assoc-value 41 ed 1.0))
+  (setq sy (db:assoc-value 42 ed 1.0))
+  (setq sz (db:assoc-value 43 ed 1.0))
+  (and (db:near-one-p sx) (db:near-one-p sy) (db:near-one-p sz))
+)
+
+(defun db:string-member-p (value values / found item)
+  (setq found nil)
+  (foreach item values
+    (if (= value item) (setq found T))
+  )
+  found
+)
+
+(defun db:editable-block-definition-p (blockname / bdef flags)
+  (setq bdef (tblsearch "BLOCK" blockname))
+  (if (or (not bdef) (= (substr blockname 1 1) "*"))
+    nil
+    (progn
+      (setq flags (db:assoc-value 70 bdef 0))
+      (= 0 (logand flags (+ 4 8 16)))
+    )
+  )
+)
+
+;;; Collect only direct LWPOLYLINE children. Nested INSERT definitions are not
+;;; modified because they may be shared by unrelated parent blocks.
+(defun db:collect-block-polylines (blockname / bdef en ed etype result)
+  (setq bdef (tblsearch "BLOCK" blockname))
+  (setq result '())
+  (if bdef
+    (progn
+      (setq en (cdr (assoc -2 bdef)))
+      (while en
+        (setq ed (entget en))
+        (setq etype (cdr (assoc 0 ed)))
+        (cond
+          ((= etype "ENDBLK") (setq en nil))
+          ((= etype "LWPOLYLINE")
+            (setq result (cons en result))
+            (setq en (entnext en))
+          )
+          (T (setq en (entnext en)))
+        )
+      )
+    )
+  )
+  (reverse result)
+)
+
+;;; Return mixed DBAUTO selection as independent containment groups:
+;;;   ((groups . ((direct nil items) (block name items) ...)) ...counters...)
+(defun db:collect-dbauto-groups (ss / i en ed etype direct-entities seen-blocks groups
+                                    blockname block-entities collected skipped-blocks
+                                    skipped-open skipped-bulge direct-count block-count)
+  (setq i 0)
+  (setq direct-entities '())
+  (setq seen-blocks '())
+  (setq groups '())
+  (setq skipped-blocks 0)
+  (setq skipped-open 0)
+  (setq skipped-bulge 0)
+  (setq block-count 0)
+  (while (< i (sslength ss))
+    (setq en (ssname ss i))
+    (setq ed (entget en))
+    (setq etype (cdr (assoc 0 ed)))
+    (cond
+      ((= etype "LWPOLYLINE")
+        (setq direct-entities (cons en direct-entities))
+      )
+      ((= etype "INSERT")
+        (setq blockname (cdr (assoc 2 ed)))
+        (cond
+          ((not (db:unit-scale-insert-p ed))
+            (setq skipped-blocks (1+ skipped-blocks))
+          )
+          ((or (not blockname)
+               (not (db:editable-block-definition-p blockname)))
+            (setq skipped-blocks (1+ skipped-blocks))
+          )
+          ((not (db:string-member-p blockname seen-blocks))
+            (setq seen-blocks (cons blockname seen-blocks))
+            (setq block-entities (db:collect-block-polylines blockname))
+            (if block-entities
+              (progn
+                (setq collected (db:collect-entities block-entities))
+                (setq groups (append groups (list (list 'block blockname (car collected)))))
+                (setq block-count (1+ block-count))
+                (setq skipped-open (+ skipped-open (cadr collected)))
+                (setq skipped-bulge (+ skipped-bulge (caddr collected)))
+              )
+              (setq skipped-blocks (1+ skipped-blocks))
+            )
+          )
+        )
+      )
+    )
+    (setq i (1+ i))
+  )
+  (setq direct-entities (reverse direct-entities))
+  (setq direct-count 0)
+  (if direct-entities
+    (progn
+      (setq collected (db:collect-entities direct-entities))
+      (setq direct-count (length (car collected)))
+      (setq groups (cons (list 'direct nil (car collected)) groups))
+      (setq skipped-open (+ skipped-open (cadr collected)))
+      (setq skipped-bulge (+ skipped-bulge (caddr collected)))
+    )
+  )
+  (list
+    (cons 'groups groups)
+    (cons 'direct-count direct-count)
+    (cons 'block-count block-count)
+    (cons 'skipped-blocks skipped-blocks)
+    (cons 'skipped-open skipped-open)
+    (cons 'skipped-bulge skipped-bulge)
+  )
 )
 
 (defun db:collect-edit-selection (ss / i en ed data verts pts area items skipped-open layer color ltype lweight)
@@ -1044,13 +1183,14 @@
   )
 )
 
-(defun db:rebuild-polyline (item patches / pts layer color ltype lweight n i patch vertices)
+(defun db:rebuild-polyline (item patches / pts layer color ltype lweight owner n i patch vertices)
   (setq pts (cadr item))
   (setq layer (nth 4 item))
   (if (not layer) (setq layer "0"))
   (setq color (nth 5 item))
   (setq ltype (nth 6 item))
   (setq lweight (nth 7 item))
+  (setq owner (cdr (assoc 330 (entget (car item)))))
   (setq n (length pts))
   (setq i 0)
   (setq vertices '())
@@ -1073,7 +1213,7 @@
     (setq i (1+ i))
   )
   (if (>= (length vertices) 3)
-    (db:make-lwpolyline layer color ltype lweight vertices)
+    (db:make-lwpolyline-owned owner layer color ltype lweight vertices)
     nil
   )
 )
@@ -1584,9 +1724,53 @@
   (princ)
 )
 
-(defun c:DBAUTO (/ olderr ss collected items skipped-open skipped-bulge tagged
-                   item result patch patches all-patches poly-count hole-count corner-count
-                   dogbone-count duplicate-count rebuilt-count newent)
+(defun db:process-dbauto-group (items / tagged item result patch patches all-patches
+                                      poly-count hole-count corner-count dogbone-count
+                                      duplicate-count rebuilt-count newent)
+  (setq tagged (db:tag-holes items))
+  (setq poly-count (length tagged))
+  (setq hole-count 0)
+  (setq corner-count 0)
+  (setq dogbone-count 0)
+  (setq duplicate-count 0)
+  (setq rebuilt-count 0)
+  (setq all-patches '())
+  (foreach item tagged
+    (if (cadddr item) (setq hole-count (1+ hole-count)))
+    (setq result (db:build-patches item all-patches))
+    (setq patches (car result))
+    (setq all-patches (append all-patches patches))
+    (setq corner-count (+ corner-count (cadr result)))
+    (setq dogbone-count (+ dogbone-count (length patches)))
+    (setq duplicate-count (+ duplicate-count (caddr result)))
+    (if *db-debug-mode*
+      (foreach patch patches (db:draw-debug-patch patch))
+    )
+    (if patches
+      (progn
+        (setq newent (db:rebuild-polyline item patches))
+        (if newent
+          (progn
+            (setq rebuilt-count (1+ rebuilt-count))
+            (if (not *db-keep-original*) (entdel (car item)))
+          )
+        )
+      )
+    )
+  )
+  (list
+    (cons 'valid poly-count)
+    (cons 'holes hole-count)
+    (cons 'corners corner-count)
+    (cons 'dogbones dogbone-count)
+    (cons 'duplicates duplicate-count)
+    (cons 'rebuilt rebuilt-count)
+  )
+)
+
+(defun c:DBAUTO (/ olderr ss selection groups group stats skipped-open skipped-bulge
+                   direct-count block-count skipped-blocks poly-count hole-count
+                   corner-count dogbone-count duplicate-count rebuilt-count)
   (db:ensure-defaults)
   (setq olderr *error*)
   (defun *error* (msg)
@@ -1597,58 +1781,48 @@
     )
     (princ)
   )
-  (prompt "\nSelect closed LWPOLYLINE outlines for C 45-degree dogbone rebuild.")
-  (setq ss (ssget '((0 . "LWPOLYLINE"))))
+  (prompt "\nSelect closed LWPOLYLINE outlines or 1:1 block references. Editing a block updates all references.")
+  (setq ss (ssget '((0 . "LWPOLYLINE,INSERT"))))
   (if ss
     (progn
       (db:start-undo)
       (if *db-debug-mode* (db:ensure-debug-layers))
-      (setq collected (db:collect-selection ss))
-      (setq items (car collected))
-      (setq skipped-open (cadr collected))
-      (setq skipped-bulge (caddr collected))
-      (setq tagged (db:tag-holes items))
-      (setq poly-count (length tagged))
+      (setq selection (db:collect-dbauto-groups ss))
+      (setq groups (cdr (assoc 'groups selection)))
+      (setq direct-count (cdr (assoc 'direct-count selection)))
+      (setq block-count (cdr (assoc 'block-count selection)))
+      (setq skipped-blocks (cdr (assoc 'skipped-blocks selection)))
+      (setq skipped-open (cdr (assoc 'skipped-open selection)))
+      (setq skipped-bulge (cdr (assoc 'skipped-bulge selection)))
+      (setq poly-count 0)
       (setq hole-count 0)
       (setq corner-count 0)
       (setq dogbone-count 0)
       (setq duplicate-count 0)
       (setq rebuilt-count 0)
-      (setq all-patches '())
-      (foreach item tagged
-        (if (cadddr item) (setq hole-count (1+ hole-count)))
-        (setq result (db:build-patches item all-patches))
-        (setq patches (car result))
-        (setq all-patches (append all-patches patches))
-        (setq corner-count (+ corner-count (cadr result)))
-        (setq dogbone-count (+ dogbone-count (length patches)))
-        (setq duplicate-count (+ duplicate-count (caddr result)))
-        (if *db-debug-mode*
-          (foreach patch patches
-            (db:draw-debug-patch patch)
-          )
-        )
-        (if patches
-          (progn
-            (setq newent (db:rebuild-polyline item patches))
-            (if newent
-              (progn
-                (setq rebuilt-count (1+ rebuilt-count))
-                (if (not *db-keep-original*) (entdel (car item)))
-              )
-            )
-          )
-        )
+      (foreach group groups
+        (setq stats (db:process-dbauto-group (nth 2 group)))
+        (setq poly-count (+ poly-count (cdr (assoc 'valid stats))))
+        (setq hole-count (+ hole-count (cdr (assoc 'holes stats))))
+        (setq corner-count (+ corner-count (cdr (assoc 'corners stats))))
+        (setq dogbone-count (+ dogbone-count (cdr (assoc 'dogbones stats))))
+        (setq duplicate-count (+ duplicate-count (cdr (assoc 'duplicates stats))))
+        (setq rebuilt-count (+ rebuilt-count (cdr (assoc 'rebuilt stats))))
       )
       (db:end-undo)
+      (if (> block-count 0) (command "_.REGEN"))
       (prompt
         (strcat
           "\nDBAUTO complete. Selected="
           (itoa (sslength ss))
-          ", valid="
+          ", direct polylines="
+          (itoa direct-count)
+          ", block definitions="
+          (itoa block-count)
+          ", valid outlines="
           (itoa poly-count)
           ", skipped="
-          (itoa (+ skipped-open skipped-bulge))
+          (itoa (+ skipped-open skipped-bulge skipped-blocks))
           ", holes="
           (itoa hole-count)
           ", recognized corners="
@@ -1667,6 +1841,9 @@
       )
       (if (> skipped-bulge 0)
         (prompt (strcat "\nSkipped polylines with arc bulges: " (itoa skipped-bulge) "."))
+      )
+      (if (> skipped-blocks 0)
+        (prompt (strcat "\nSkipped scaled, unsupported, or empty block references: " (itoa skipped-blocks) "."))
       )
       (if (and (> hole-count 0) (not *db-process-holes*))
         (prompt "\nHole outlines were detected but hole processing is disabled.")
