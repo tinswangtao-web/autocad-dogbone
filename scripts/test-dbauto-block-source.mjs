@@ -68,6 +68,30 @@ assert.match(
   "Replacement polylines should preserve their source owner",
 );
 
+assert.match(
+  source,
+  /\(defun db:update-lwpolyline-in-place\b/,
+  "Block geometry should have a dedicated in-place update helper",
+);
+
+assert.match(
+  source,
+  /\(entmod modified\)/,
+  "Block geometry should be persisted with entmod",
+);
+
+assert.match(
+  dbauto,
+  /\(db:process-dbauto-group \(car group\) \(nth 2 group\)\)/,
+  "DBAUTO should pass group kind into persistence processing",
+);
+
+assert.match(
+  source,
+  /\(if \(= group-kind 'block\)[\s\S]*?\(db:update-lwpolyline-in-place/,
+  "Block groups should update existing polylines in place",
+);
+
 function assertBalancedParens(text) {
   let depth = 0;
   let inString = false;
