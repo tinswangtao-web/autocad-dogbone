@@ -79,4 +79,3 @@ Manual AutoCAD verification will cover:
 4. A scaled reference is skipped with a clear message and remains unchanged.
 5. A block containing outer and hole polylines preserves containment-based corner handling.
 6. Direct `LWPOLYLINE` selection still behaves as before.
-

@@ -290,4 +290,3 @@ Confirm that only the intended files were committed and that the pre-existing de
 - [ ] **Step 3: Record manual AutoCAD checks still required**
 
 Because the repository has no AutoCAD runtime harness, report the six manual scenarios from the design document as pending real-application validation. Do not claim runtime verification from source-level tests alone.
-
