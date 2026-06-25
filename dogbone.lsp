@@ -30,6 +30,8 @@
 (setq *db-debug-mode* nil)
 (setq *db-restore-bulge-tol* 0.05)
 (setq *db-eps* 1.0e-8)
+(setq *db-circle-min-vertices* 24)
+(setq *db-circle-radius-tol* 0.001)
 (setq *db-nest-gap* 6.0)
 (setq *db-nest-sheet-gap* 50.0)
 
@@ -45,6 +47,8 @@
   (if (not (boundp '*db-debug-mode*)) (setq *db-debug-mode* nil))
   (if (not *db-restore-bulge-tol*) (setq *db-restore-bulge-tol* 0.05))
   (if (not *db-eps*) (setq *db-eps* 1.0e-8))
+  (if (not *db-circle-min-vertices*) (setq *db-circle-min-vertices* 24))
+  (if (not *db-circle-radius-tol*) (setq *db-circle-radius-tol* 0.001))
   (if (not *db-nest-gap*) (setq *db-nest-gap* 6.0))
   (if (not *db-nest-sheet-gap*) (setq *db-nest-sheet-gap* 50.0))
 )
@@ -443,6 +447,69 @@
   )
 )
 
+;;; Fallback where one adjacent segment is shorter than the standard C dogbone
+;;; trim. Use the short segment endpoint as one circle point, solve the other
+;;; point on the long segment so the chord is 2R, and keep the arc close to the
+;;; original corner.
+(defun db:create-short-leg-c-patch (p0 p1 p2 radius source-index / v1 v2 len1 len2 theta chord cos-theta sin-theta short-len long-len short-dir long-dir disc long-trim center start end bulge)
+  (setq v1 (db:norm (db:sub p0 p1)))
+  (setq v2 (db:norm (db:sub p2 p1)))
+  (if (and v1 v2)
+    (progn
+      (setq theta (db:acos (db:dot v1 v2)))
+      (setq len1 (db:distance p0 p1))
+      (setq len2 (db:distance p2 p1))
+      (setq chord (* 2.0 radius))
+      (setq cos-theta (cos theta))
+      (setq sin-theta (sin theta))
+      (if (< len1 len2)
+        (progn
+          (setq short-len len1)
+          (setq long-len len2)
+          (setq short-dir v1)
+          (setq long-dir v2)
+        )
+        (progn
+          (setq short-len len2)
+          (setq long-len len1)
+          (setq short-dir v2)
+          (setq long-dir v1)
+        )
+      )
+      (setq disc (- (* chord chord) (* short-len short-len sin-theta sin-theta)))
+      (if (and
+            (> (abs (- len1 len2)) *db-eps*)
+            (> disc *db-eps*)
+            (< short-len chord)
+          )
+        (progn
+          (setq long-trim (+ (* short-len cos-theta) (sqrt disc)))
+          (if (and (> long-trim *db-eps*) (<= long-trim (+ long-len *db-eps*)))
+            (progn
+              (if (< len1 len2)
+                (progn
+                  (setq start p0)
+                  (setq end (db:add p1 (db:mul long-dir long-trim)))
+                )
+                (progn
+                  (setq start (db:add p1 (db:mul long-dir long-trim)))
+                  (setq end p2)
+                )
+              )
+              (setq center (db:mul (db:add start end) 0.5))
+              (setq bulge (db:arc-bulge-near-corner center radius start end p1))
+              (db:make-production-patch "circle-short-leg" source-index p1 center start end radius bulge theta "C Short-Leg")
+            )
+            nil
+          )
+        )
+        nil
+      )
+    )
+    nil
+  )
+)
+
 ;;; Phase 0 Mode A: offset-center circle tangent to both corner edges.
 (defun db:mode-a-patch (p0 p1 p2 radius / v1 v2 center theta tangent start end)
   (setq v1 (db:norm (db:sub p0 p1)))
@@ -579,8 +646,9 @@
 
 ;;; Parse an LWPOLYLINE into:
 ;;;   (closedFlag ((point bulgeAfter) ...))
-;;; Bulge belongs to the segment starting at that point. Any non-zero bulge is
-;;; skipped by DBAUTO because this release handles only straight source edges.
+;;; Bulge belongs to the segment starting at that point. DBAUTO preserves
+;;; untouched bulges but only applies the current C patch to sharp line-line
+;;; dogbone candidates.
 (defun db:lwpoly-data (ename / ed closed verts curpt curbulge d)
   (setq ed (entget ename))
   (setq closed (= 1 (logand 1 (cdr (assoc 70 ed)))))
@@ -623,6 +691,126 @@
     (setq pts (cons (car v) pts))
   )
   (reverse pts)
+)
+
+;;; Confirm that vertices traverse the fitted circle once in one direction.
+(defun db:circle-ordered-p (pts center / n i p q angle step-sign direction total valid)
+  (setq n (length pts))
+  (setq i 0)
+  (setq direction nil)
+  (setq total 0.0)
+  (setq valid T)
+  (while (and valid (< i n))
+    (setq p (nth i pts))
+    (setq q (nth (rem (1+ i) n) pts))
+    (if (<= (db:distance p q) *db-eps*)
+      (setq valid nil)
+      (progn
+        (setq angle (db:signed-angle (db:sub p center) (db:sub q center)))
+        (if (<= (abs angle) *db-eps*)
+          (setq valid nil)
+          (progn
+            (setq step-sign (if (> angle 0.0) 1.0 -1.0))
+            (if (not direction)
+              (setq direction step-sign)
+              (if (/= step-sign direction) (setq valid nil))
+            )
+            (setq total (+ total angle))
+          )
+        )
+      )
+    )
+    (setq i (1+ i))
+  )
+  (and valid (<= (abs (- (abs total) (* 2.0 pi))) 0.01))
+)
+
+;;; Recognize an even, symmetric straight-segment outline whose opposite vertex
+;;; pairs define one center and whose vertices lie on one circle.
+;;; The caller is responsible for checking closure and existing bulges.
+(defun db:segmented-circle-data (pts / n half center radius max-error max-center-error
+                                      i p q pair-center error center-error)
+  (setq n (length pts))
+  (if (or
+        (< (length pts) *db-circle-min-vertices*)
+        (= 1 (rem n 2))
+      )
+    nil
+    (progn
+      (setq half (fix (/ n 2)))
+      (setq center (db:mul (db:add (nth 0 pts) (nth half pts)) 0.5))
+      (setq radius (db:distance center (nth 0 pts)))
+      (if (<= radius *db-eps*)
+        nil
+        (progn
+          (setq i 0)
+          (setq max-error 0.0)
+          (setq max-center-error 0.0)
+          (while (< i half)
+            (setq p (nth i pts))
+            (setq q (nth (+ i half) pts))
+            (setq pair-center (db:mul (db:add p q) 0.5))
+            (setq center-error (db:distance pair-center center))
+            (if (> center-error (* radius *db-circle-radius-tol*))
+              (setq max-center-error center-error)
+            )
+            (setq i (1+ i))
+          )
+          (foreach p pts
+            (setq error (abs (- (db:distance center p) radius)))
+            (if (> error max-error) (setq max-error error))
+          )
+          (if (or
+                (> max-error (* radius *db-circle-radius-tol*))
+                (> max-center-error (* radius *db-circle-radius-tol*))
+                (not (db:circle-ordered-p pts center))
+              )
+            nil
+            (list center radius)
+          )
+        )
+      )
+    )
+  )
+)
+
+;;; Create a true CIRCLE for a directly selected segmented-circle item.
+(defun db:make-circle-from-item (item circle-data / layer color ltype lweight center radius data)
+  (setq layer (nth 4 item))
+  (setq color (nth 5 item))
+  (setq ltype (nth 6 item))
+  (setq lweight (nth 7 item))
+  (setq center (car circle-data))
+  (setq radius (cadr circle-data))
+  (setq data
+    (list
+      '(0 . "CIRCLE")
+      '(100 . "AcDbEntity")
+      (cons 8 layer)
+    )
+  )
+  (if color (setq data (append data (list (cons 62 color)))))
+  (if ltype (setq data (append data (list (cons 6 ltype)))))
+  (if lweight (setq data (append data (list (cons 370 lweight)))))
+  (setq data
+    (append
+      data
+      (list
+        '(100 . "AcDbCircle")
+        (cons 10 (db:pt2 center))
+        (cons 40 radius)
+      )
+    )
+  )
+  (entmakex data)
+)
+
+;;; Exact full-circle LWPOLYLINE representation for in-place block updates.
+(defun db:circle-polyline-vertices (center radius area / start end bulge)
+  (setq start (list (+ (db:x center) radius) (db:y center) 0.0))
+  (setq end (list (- (db:x center) radius) (db:y center) 0.0))
+  (setq bulge (if (> area 0.0) 1.0 -1.0))
+  (list (list start bulge) (list end bulge))
 )
 
 ;;; Decide whether a selected polyline is a hole by containment.
@@ -709,11 +897,11 @@
 )
 
 (defun db:start-undo ()
-  (command "_.UNDO" "_Begin")
+  (command-s "_.UNDO" "_Begin")
 )
 
 (defun db:end-undo ()
-  (command "_.UNDO" "_End")
+  (command-s "_.UNDO" "_End")
 )
 
 (defun c:DBSET (/ d)
@@ -794,7 +982,7 @@
   (princ)
 )
 
-(defun db:collect-entities (entities / en data ed verts pts area items skipped-open skipped-bulge layer color ltype lweight)
+(defun db:collect-entities (entities / en data ed verts pts area circle-data items skipped-open skipped-bulge layer color ltype lweight)
   (setq items '())
   (setq skipped-open 0)
   (setq skipped-bulge 0)
@@ -809,19 +997,17 @@
       ((< (length verts) 3)
         (setq skipped-open (1+ skipped-open))
       )
-      ((db:has-bulge verts)
-        (setq skipped-bulge (1+ skipped-bulge))
-      )
       (T
         (setq pts (db:vertex-points verts))
         (setq area (db:poly-area pts))
         (if (> (abs area) *db-eps*)
           (progn
+            (setq circle-data (if (db:has-bulge verts) nil (db:segmented-circle-data pts)))
             (setq layer (cdr (assoc 8 ed)))
             (setq color (cdr (assoc 62 ed)))
             (setq ltype (cdr (assoc 6 ed)))
             (setq lweight (cdr (assoc 370 ed)))
-            (setq items (cons (list en pts area nil layer color ltype lweight) items))
+            (setq items (cons (list en pts area nil layer color ltype lweight verts circle-data) items))
           )
           (setq skipped-open (1+ skipped-open))
         )
@@ -1065,6 +1251,10 @@
   (nth 8 item)
 )
 
+(defun db:item-circle-data (item)
+  (nth 9 item)
+)
+
 (defun db:vertex-bulge (verts idx)
   (cadr (nth idx verts))
 )
@@ -1076,6 +1266,38 @@
   (and
     (<= (abs prev-bulge) *db-eps*)
     (<= (abs this-bulge) *db-eps*)
+  )
+)
+
+(defun db:auto-corner-candidate-p (verts idx p0 p1 p2 area is-hole)
+  (and
+    (db:sharp-corner-p verts idx)
+    (db:needs-dogbone p0 p1 p2 area is-hole)
+  )
+)
+
+(defun db:patch-before-bulge (patch / found)
+  (setq found (assoc 'before-bulge patch))
+  (if found (cdr found) 0.0)
+)
+
+(defun db:patch-after-bulge (patch / found)
+  (setq found (assoc 'after-bulge patch))
+  (if found (cdr found) 0.0)
+)
+
+(defun db:attach-source-bulges (patch verts idx / n prev-bulge this-bulge)
+  (setq n (length verts))
+  (setq prev-bulge (db:vertex-bulge verts (rem (+ idx n -1) n)))
+  (setq this-bulge (db:vertex-bulge verts idx))
+  (if patch
+    (append
+      patch
+      (list
+        (cons 'before-bulge prev-bulge)
+        (cons 'after-bulge this-bulge)
+      )
+    )
   )
 )
 
@@ -1136,60 +1358,73 @@
   dup
 )
 
+(defun db:create-c-or-short-leg-patch (p0 p1 p2 radius source-index / patch)
+  (setq patch (db:create-c-patch p0 p1 p2 radius source-index))
+  (if (not patch)
+    (setq patch (db:create-short-leg-c-patch p0 p1 p2 radius source-index))
+  )
+  patch
+)
+
 (defun db:create-patch (p0 p1 p2 index / r)
   (setq r (db:radius))
   (cond
     ((= *db-dogbone-type* "C")
-      (db:create-c-patch p0 p1 p2 r index)
+      (db:create-c-or-short-leg-patch p0 p1 p2 r index)
     )
     (T
-      (db:create-c-patch p0 p1 p2 r index)
+      (db:create-c-or-short-leg-patch p0 p1 p2 r index)
     )
   )
 )
 
-(defun db:build-patches (item existing / pts area is-hole n i p0 p1 p2 patch patches corners dupes)
+(defun db:build-patches (item existing / pts area is-hole verts n i p0 p1 p2 patch patches corners dupes failed)
   (setq pts (cadr item))
   (setq area (caddr item))
   (setq is-hole (cadddr item))
+  (setq verts (db:item-verts item))
   (setq n (length pts))
   (setq i 0)
   (setq patches '())
   (setq corners 0)
   (setq dupes 0)
+  (setq failed 0)
   (if (and is-hole (not *db-process-holes*))
-    (list '() 0 0)
+    (list '() 0 0 0)
     (progn
       (while (< i n)
         (setq p0 (nth (rem (+ i n -1) n) pts))
         (setq p1 (nth i pts))
         (setq p2 (nth (rem (1+ i) n) pts))
-        (if (db:needs-dogbone p0 p1 p2 area is-hole)
+        (if (db:auto-corner-candidate-p verts i p0 p1 p2 area is-hole)
           (progn
             (setq corners (1+ corners))
             (setq patch (db:create-patch p0 p1 p2 i))
+            (setq patch (db:attach-source-bulges patch verts i))
             (if patch
               (if (db:duplicate-patch-p patch (append existing patches) *db-duplicate-tol*)
                 (setq dupes (1+ dupes))
                 (setq patches (cons patch patches))
               )
+              (setq failed (1+ failed))
             )
           )
         )
         (setq i (1+ i))
       )
-      (list (reverse patches) corners dupes)
+      (list (reverse patches) corners dupes failed)
     )
   )
 )
 
-(defun db:build-replacement-vertices (item patches / pts n i patch vertices)
-  (setq pts (cadr item))
-  (setq n (length pts))
+(defun db:build-replacement-vertices (item patches / verts n i patch next-patch vertices)
+  (setq verts (db:item-verts item))
+  (setq n (length verts))
   (setq i 0)
   (setq vertices '())
   (while (< i n)
     (setq patch (db:find-patch i patches))
+    (setq next-patch (db:find-patch (rem (1+ i) n) patches))
     (if patch
       (progn
         (setq vertices
@@ -1197,12 +1432,22 @@
             vertices
             (list
               (list (cdr (assoc 'start patch)) (cdr (assoc 'bulge patch)))
-              (list (cdr (assoc 'end patch)) 0.0)
+              (list (cdr (assoc 'end patch)) (db:patch-after-bulge patch))
             )
           )
         )
       )
-      (setq vertices (append vertices (list (list (nth i pts) 0.0))))
+      (setq vertices
+        (append
+          vertices
+          (list
+            (list
+              (car (nth i verts))
+              (if next-patch (db:patch-before-bulge next-patch) (cadr (nth i verts)))
+            )
+          )
+        )
+      )
     )
     (setq i (1+ i))
   )
@@ -1777,38 +2022,70 @@
 
 (defun db:process-dbauto-group (group-kind items / tagged item result patch patches all-patches
                                       poly-count hole-count corner-count dogbone-count
-                                      duplicate-count rebuilt-count vertices newent)
+                                      duplicate-count failed-count rebuilt-count circle-data
+                                      circle-detected-count circle-converted-count
+                                      circle-failed-count vertices newent)
   (setq tagged (db:tag-holes items))
   (setq poly-count (length tagged))
   (setq hole-count 0)
   (setq corner-count 0)
   (setq dogbone-count 0)
   (setq duplicate-count 0)
+  (setq failed-count 0)
   (setq rebuilt-count 0)
+  (setq circle-detected-count 0)
+  (setq circle-converted-count 0)
+  (setq circle-failed-count 0)
   (setq all-patches '())
   (foreach item tagged
+    (setq newent nil)
+    (setq circle-data (db:item-circle-data item))
     (if (cadddr item) (setq hole-count (1+ hole-count)))
-    (setq result (db:build-patches item all-patches))
-    (setq patches (car result))
-    (setq all-patches (append all-patches patches))
-    (setq corner-count (+ corner-count (cadr result)))
-    (setq dogbone-count (+ dogbone-count (length patches)))
-    (setq duplicate-count (+ duplicate-count (caddr result)))
-    (if *db-debug-mode*
-      (foreach patch patches (db:draw-debug-patch patch))
-    )
-    (if patches
+    (if circle-data
       (progn
-        (setq vertices (db:build-replacement-vertices item patches))
+        (setq circle-detected-count (1+ circle-detected-count))
         (if (= group-kind 'block)
-          (setq newent (db:update-lwpolyline-in-place (car item) vertices))
+          (setq newent
+            (db:update-lwpolyline-in-place
+              (car item)
+              (db:circle-polyline-vertices (car circle-data) (cadr circle-data) (caddr item))
+            )
+          )
           (progn
-            (setq newent (db:rebuild-polyline-from-vertices item vertices))
+            (setq newent (db:make-circle-from-item item circle-data))
             (if (and newent (not *db-keep-original*)) (entdel (car item)))
           )
         )
         (if newent
-          (setq rebuilt-count (1+ rebuilt-count))
+          (setq circle-converted-count (1+ circle-converted-count))
+          (setq circle-failed-count (1+ circle-failed-count))
+        )
+      )
+      (progn
+        (setq result (db:build-patches item all-patches))
+        (setq patches (car result))
+        (setq all-patches (append all-patches patches))
+        (setq corner-count (+ corner-count (cadr result)))
+        (setq dogbone-count (+ dogbone-count (length patches)))
+        (setq duplicate-count (+ duplicate-count (caddr result)))
+        (setq failed-count (+ failed-count (cadddr result)))
+        (if *db-debug-mode*
+          (foreach patch patches (db:draw-debug-patch patch))
+        )
+        (if patches
+          (progn
+            (setq vertices (db:build-replacement-vertices item patches))
+            (if (= group-kind 'block)
+              (setq newent (db:update-lwpolyline-in-place (car item) vertices))
+              (progn
+                (setq newent (db:rebuild-polyline-from-vertices item vertices))
+                (if (and newent (not *db-keep-original*)) (entdel (car item)))
+              )
+            )
+            (if newent
+              (setq rebuilt-count (1+ rebuilt-count))
+            )
+          )
         )
       )
     )
@@ -1819,13 +2096,18 @@
     (cons 'corners corner-count)
     (cons 'dogbones dogbone-count)
     (cons 'duplicates duplicate-count)
+    (cons 'failed failed-count)
     (cons 'rebuilt rebuilt-count)
+    (cons 'circles-detected circle-detected-count)
+    (cons 'circles-converted circle-converted-count)
+    (cons 'circle-failures circle-failed-count)
   )
 )
 
 (defun c:DBAUTO (/ olderr ss selection groups group stats skipped-open skipped-bulge
                    direct-count block-count skipped-blocks poly-count hole-count
-                   corner-count dogbone-count duplicate-count rebuilt-count)
+                   corner-count dogbone-count duplicate-count failed-count rebuilt-count
+                   circle-detected-count circle-converted-count circle-failed-count)
   (db:ensure-defaults)
   (setq olderr *error*)
   (defun *error* (msg)
@@ -1854,7 +2136,11 @@
       (setq corner-count 0)
       (setq dogbone-count 0)
       (setq duplicate-count 0)
+      (setq failed-count 0)
       (setq rebuilt-count 0)
+      (setq circle-detected-count 0)
+      (setq circle-converted-count 0)
+      (setq circle-failed-count 0)
       (foreach group groups
         (setq stats (db:process-dbauto-group (car group) (nth 2 group)))
         (setq poly-count (+ poly-count (cdr (assoc 'valid stats))))
@@ -1862,7 +2148,11 @@
         (setq corner-count (+ corner-count (cdr (assoc 'corners stats))))
         (setq dogbone-count (+ dogbone-count (cdr (assoc 'dogbones stats))))
         (setq duplicate-count (+ duplicate-count (cdr (assoc 'duplicates stats))))
+        (setq failed-count (+ failed-count (cdr (assoc 'failed stats))))
         (setq rebuilt-count (+ rebuilt-count (cdr (assoc 'rebuilt stats))))
+        (setq circle-detected-count (+ circle-detected-count (cdr (assoc 'circles-detected stats))))
+        (setq circle-converted-count (+ circle-converted-count (cdr (assoc 'circles-converted stats))))
+        (setq circle-failed-count (+ circle-failed-count (cdr (assoc 'circle-failures stats))))
       )
       (db:end-undo)
       (if (> block-count 0) (command "_.REGEN"))
@@ -1886,8 +2176,16 @@
           (itoa dogbone-count)
           ", duplicates skipped="
           (itoa duplicate-count)
+          ", dogbone geometry failed="
+          (itoa failed-count)
           ", rebuilt polylines="
           (itoa rebuilt-count)
+          ", segmented circles detected="
+          (itoa circle-detected-count)
+          ", circles converted="
+          (itoa circle-converted-count)
+          ", circle conversions failed="
+          (itoa circle-failed-count)
           "."
         )
       )
