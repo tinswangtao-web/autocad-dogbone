@@ -5,7 +5,7 @@ const source = fs.readFileSync(new URL("../dogbone.lsp", import.meta.url), "utf8
 
 assert.match(
   source,
-  /\(setq \*db-version\* "V2\.1-Nest-Compact"\)/,
+  /\(setq \*db-version\* "V2\.1-Nest-Compact-500"\)/,
   "The plugin should expose a unique compact-packing version so AutoCAD reloads are visible",
 );
 
@@ -19,6 +19,12 @@ assert.match(
   source,
   /\(setq \*db-nest-edge-margin\* 2\.0\)/,
   "Default component-to-sheet-edge nesting margin should be 2 mm",
+);
+
+assert.match(
+  source,
+  /\(setq \*db-nest-sheet-gap\* 500\.0\)/,
+  "Default copied sheet-to-sheet spacing should be 500 mm",
 );
 
 assert.match(
@@ -418,6 +424,12 @@ assert.match(
   source,
   /\(defun db:normalize-sheet-gap\b/,
   "Copied sheet spacing should normalize zero or invalid sheet gaps to a positive default",
+);
+
+assert.match(
+  source,
+  /\(defun db:normalize-sheet-gap\b[\s\S]*?500\.0/,
+  "Invalid copied sheet spacing should fall back to the 500 mm default",
 );
 
 assert.match(

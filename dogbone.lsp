@@ -19,7 +19,7 @@
 ;;; Production mode creates a new closed LWPOLYLINE and deletes the original
 ;;; only after the replacement entity is created successfully.
 
-(setq *db-version* "V2.1-Nest-Compact")
+(setq *db-version* "V2.1-Nest-Compact-500")
 (setq *db-tool-dia* 6.0)
 (setq *db-layer* "DOGBONE")
 (setq *db-process-holes* T)
@@ -38,7 +38,7 @@
 (setq *db-polyarc-fit-tol* 0.05)
 (setq *db-nest-gap* 6.0)
 (setq *db-nest-edge-margin* 2.0)
-(setq *db-nest-sheet-gap* 50.0)
+(setq *db-nest-sheet-gap* 500.0)
 (setq *db-last-nest-raw-count* 0)
 (setq *db-last-nest-group-count* 0)
 (setq *db-last-tail-compact-status* "SKIPPED")
@@ -65,7 +65,7 @@
   (if (not *db-polyarc-fit-tol*) (setq *db-polyarc-fit-tol* 0.05))
   (if (not *db-nest-gap*) (setq *db-nest-gap* 6.0))
   (if (not *db-nest-edge-margin*) (setq *db-nest-edge-margin* 2.0))
-  (if (not *db-nest-sheet-gap*) (setq *db-nest-sheet-gap* 50.0))
+  (if (not *db-nest-sheet-gap*) (setq *db-nest-sheet-gap* 500.0))
   (if (not (boundp '*db-last-nest-raw-count*)) (setq *db-last-nest-raw-count* 0))
   (if (not (boundp '*db-last-nest-group-count*)) (setq *db-last-nest-group-count* 0))
   (if (not (boundp '*db-last-tail-compact-status*)) (setq *db-last-tail-compact-status* "SKIPPED"))
@@ -3149,7 +3149,7 @@
 (defun db:normalize-sheet-gap (sheet-gap)
   (if (and sheet-gap (> sheet-gap 0.0))
     sheet-gap
-    50.0
+    500.0
   )
 )
 
