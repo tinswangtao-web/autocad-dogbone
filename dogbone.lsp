@@ -3,6 +3,7 @@
 ;;; Stable version: V2.1
 ;;;
 ;;; Commands:
+;;;   DBVER   - Show loaded plugin version.
 ;;;   DBSET   - Set tool diameter and whether contained hole outlines are handled.
 ;;;   DB1     - Draw A/B/C single-corner test geometry for review.
 ;;;   DBDEBUG - Draw debug markers for recognized dogbone corners.
@@ -11,14 +12,14 @@
 ;;;   DBRESTOREALL - Restore all dogbones in selected polylines.
 ;;;   DBAUTO  - Rebuild selected closed LWPOLYLINE entities or 1:1 block definitions
 ;;;             with C 45-degree dogbones.
-;;;   DBNSET  - Set nesting gap (minimum spacing between parts, default 6 mm).
-;;;   DBNEST  - Pack selected parts into a rectangular sheet with AABB nesting.
-;;;   DBNESTM - Pack selected parts across copied sheet frames.
+;;;   DBNSET  - Set nesting gap and sheet edge margin.
+;;;   DBNEST  - Pack selected parts across copied sheet frames.
+;;;   DBNESTM - Compatibility alias for multi-sheet nesting.
 ;;;
 ;;; Production mode creates a new closed LWPOLYLINE and deletes the original
 ;;; only after the replacement entity is created successfully.
 
-(setq *db-version* "V2.1-Nest")
+(setq *db-version* "V2.1-Nest-Compact")
 (setq *db-tool-dia* 6.0)
 (setq *db-layer* "DOGBONE")
 (setq *db-process-holes* T)
@@ -33,7 +34,14 @@
 (setq *db-circle-min-vertices* 24)
 (setq *db-circle-radius-tol* 0.001)
 (setq *db-nest-gap* 6.0)
+(setq *db-nest-edge-margin* 2.0)
 (setq *db-nest-sheet-gap* 50.0)
+(setq *db-last-nest-raw-count* 0)
+(setq *db-last-nest-group-count* 0)
+(setq *db-last-tail-compact-status* "SKIPPED")
+(setq *db-last-tail-compact-before* 0)
+(setq *db-last-tail-compact-after* 0)
+(setq *db-last-tail-compact-count* 0)
 
 (defun db:ensure-defaults ()
   (if (not *db-tool-dia*) (setq *db-tool-dia* 6.0))
@@ -50,7 +58,24 @@
   (if (not *db-circle-min-vertices*) (setq *db-circle-min-vertices* 24))
   (if (not *db-circle-radius-tol*) (setq *db-circle-radius-tol* 0.001))
   (if (not *db-nest-gap*) (setq *db-nest-gap* 6.0))
+  (if (not *db-nest-edge-margin*) (setq *db-nest-edge-margin* 2.0))
   (if (not *db-nest-sheet-gap*) (setq *db-nest-sheet-gap* 50.0))
+  (if (not (boundp '*db-last-nest-raw-count*)) (setq *db-last-nest-raw-count* 0))
+  (if (not (boundp '*db-last-nest-group-count*)) (setq *db-last-nest-group-count* 0))
+  (if (not (boundp '*db-last-tail-compact-status*)) (setq *db-last-tail-compact-status* "SKIPPED"))
+  (if (not (boundp '*db-last-tail-compact-before*)) (setq *db-last-tail-compact-before* 0))
+  (if (not (boundp '*db-last-tail-compact-after*)) (setq *db-last-tail-compact-after* 0))
+  (if (not (boundp '*db-last-tail-compact-count*)) (setq *db-last-tail-compact-count* 0))
+)
+
+(defun c:DBVER ()
+  (prompt
+    (strcat
+      "\nDogbone plugin version: " *db-version*
+      "\nLoaded commands include: DBVER, DBSET, DB1, DBDEBUG, DBAUTO, DBADD, DBRESTORE, DBRESTOREALL, DBNSET, DBNEST, DBNESTM."
+    )
+  )
+  (princ)
 )
 
 (defun db:radius ()
@@ -2211,22 +2236,101 @@
 ;;; =========================================================================
 ;;; NESTING / PACKING MODULE  (V2.1-Nest)
 ;;; =========================================================================
-;;; Arranges selected LWPOLYLINE / INSERT parts into a rectangular sheet
-;;; using an AABB bottom-left packing algorithm.
-;;; New commands: DBNSET (set gap), DBNEST (single sheet), DBNESTM (multi sheet).
+;;; Arranges selected LWPOLYLINE / INSERT parts across copied rectangular sheets
+;;; using an AABB MaxRects packing algorithm.
+;;; Commands: DBNSET (set gap/margin), DBNEST (multi sheet), DBNESTM (compatibility alias).
 ;;; =========================================================================
 
 ;;; ---------------------------------------------------------------------------
 ;;; db:lwpoly-bbox  —  AABB for a LWPOLYLINE entity
 ;;; Returns (min-x min-y max-x max-y) or nil
 ;;; ---------------------------------------------------------------------------
-(defun db:lwpoly-bbox (ename / data verts pts p minx miny maxx maxy)
-  (setq data (db:lwpoly-data ename))
-  (setq verts (cadr data))
-  (if (null verts)
+(defun db:positive-angle (a)
+  (while (< a 0.0)
+    (setq a (+ a (* 2.0 pi)))
+  )
+  (while (>= a (* 2.0 pi))
+    (setq a (- a (* 2.0 pi)))
+  )
+  a
+)
+
+(defun db:ccw-angle-delta (from-angle to-angle)
+  (db:positive-angle (- to-angle from-angle))
+)
+
+(defun db:angle-on-bulge-arc-p (angle start-angle end-angle bulge / span offset)
+  (if (> bulge 0.0)
+    (progn
+      (setq span (* 4.0 (atan bulge)))
+      (setq offset (db:ccw-angle-delta start-angle angle))
+      (<= offset (+ span *db-eps*))
+    )
+    (progn
+      (setq span (* -4.0 (atan bulge)))
+      (setq offset (db:ccw-angle-delta angle start-angle))
+      (<= offset (+ span *db-eps*))
+    )
+  )
+)
+
+(defun db:bulge-arc-bbox-points (start end bulge
+                                 / chord len mid unit left center-dist center radius
+                                   start-angle end-angle angles a pts)
+  (setq pts '())
+  (if (> (abs bulge) *db-eps*)
+    (progn
+      (setq chord (db:sub end start))
+      (setq len (db:len chord))
+      (if (> len *db-eps*)
+        (progn
+          (setq mid (db:mul (db:add start end) 0.5))
+          (setq unit (db:mul chord (/ 1.0 len)))
+          (setq left (list (- (db:y unit)) (db:x unit) 0.0))
+          (setq center-dist (/ (* len (- 1.0 (* bulge bulge))) (* 4.0 bulge)))
+          (setq center (db:add mid (db:mul left center-dist)))
+          (setq radius (/ (* len (+ 1.0 (* bulge bulge))) (* 4.0 (abs bulge))))
+          (setq start-angle (db:angle (db:sub start center)))
+          (setq end-angle (db:angle (db:sub end center)))
+          (setq angles (list 0.0 (/ pi 2.0) pi (* 1.5 pi)))
+          (foreach a angles
+            (if (db:angle-on-bulge-arc-p a start-angle end-angle bulge)
+              (setq pts (cons (db:point-on-circle center radius a) pts))
+            )
+          )
+        )
+      )
+    )
+  )
+  pts
+)
+
+(defun db:lwpoly-bbox-points (closed verts / pts n i current next)
+  (setq pts (db:vertex-points verts))
+  (setq n (length verts))
+  (setq i 0)
+  (while (< i n)
+    (if (or closed (< i (1- n)))
+      (progn
+        (setq current (nth i verts))
+        (setq next (nth (rem (1+ i) n) verts))
+        (setq pts
+          (append
+            pts
+            (db:bulge-arc-bbox-points (car current) (car next) (cadr current))
+          )
+        )
+      )
+    )
+    (setq i (1+ i))
+  )
+  pts
+)
+
+(defun db:bbox-from-points (pts / p minx miny maxx maxy)
+  (if (or (not pts) (null pts))
     nil
     (progn
-      (setq pts (db:vertex-points verts))
       (setq p (car pts))
       (setq minx (db:x p))
       (setq miny (db:y p))
@@ -2243,6 +2347,34 @@
   )
 )
 
+(defun db:lwpoly-bbox (ename / data closed verts pts)
+  (setq data (db:lwpoly-data ename))
+  (setq closed (car data))
+  (setq verts (cadr data))
+  (if (null verts)
+    nil
+    (progn
+      (setq pts (db:lwpoly-bbox-points closed verts))
+      (db:bbox-from-points pts)
+    )
+  )
+)
+
+(defun db:circle-bbox (ename / ed center radius)
+  (setq ed (entget ename))
+  (setq center (cdr (assoc 10 ed)))
+  (setq radius (cdr (assoc 40 ed)))
+  (if (and center radius)
+    (list
+      (- (db:x center) radius)
+      (- (db:y center) radius)
+      (+ (db:x center) radius)
+      (+ (db:y center) radius)
+    )
+    nil
+  )
+)
+
 ;;; ---------------------------------------------------------------------------
 ;;; db:insert-collect-pts  —  Recursively collect world-coordinate points
 ;;; from all LWPOLYLINE entities inside a block definition.
@@ -2253,7 +2385,8 @@
 (defun db:insert-collect-pts (blockname sx sy rot insx insy
                               / bdef sub-en ed etype allpts
                                 sub-bn sub-ins sub-sx sub-sy sub-rot
-                                data verts v px py rx ry cos-r sin-r
+                                data pts v px py rx ry cos-r sin-r
+                                circle-center circle-radius
                                 nested-pts)
   (setq bdef (tblsearch "BLOCK" blockname))
   (if (not bdef)
@@ -2270,15 +2403,38 @@
           ;; LWPOLYLINE inside block: collect its vertices
           ((= etype "LWPOLYLINE")
             (setq data (db:lwpoly-data sub-en))
-            (setq verts (cadr data))
-            (foreach v verts
-              (setq px (* (db:x (car v)) sx))
-              (setq py (* (db:y (car v)) sy))
+            (setq pts (db:lwpoly-bbox-points (car data) (cadr data)))
+            (foreach v pts
+              (setq px (* (db:x v) sx))
+              (setq py (* (db:y v) sy))
               ;; rotate
               (setq rx (- (* px cos-r) (* py sin-r)))
               (setq ry (+ (* px sin-r) (* py cos-r)))
               ;; translate
               (setq allpts (cons (list (+ rx insx) (+ ry insy) 0.0) allpts))
+            )
+          )
+          ((= etype "CIRCLE")
+            (setq circle-center (cdr (assoc 10 ed)))
+            (setq circle-radius (cdr (assoc 40 ed)))
+            (if (and circle-center circle-radius)
+              (progn
+                (setq pts
+                  (list
+                    (list (+ (db:x circle-center) circle-radius) (db:y circle-center) 0.0)
+                    (list (- (db:x circle-center) circle-radius) (db:y circle-center) 0.0)
+                    (list (db:x circle-center) (+ (db:y circle-center) circle-radius) 0.0)
+                    (list (db:x circle-center) (- (db:y circle-center) circle-radius) 0.0)
+                  )
+                )
+                (foreach v pts
+                  (setq px (* (db:x v) sx))
+                  (setq py (* (db:y v) sy))
+                  (setq rx (- (* px cos-r) (* py sin-r)))
+                  (setq ry (+ (* px sin-r) (* py cos-r)))
+                  (setq allpts (cons (list (+ rx insx) (+ ry insy) 0.0) allpts))
+                )
+              )
             )
           )
           ;; Nested INSERT: recurse
@@ -2417,11 +2573,40 @@
   )
 )
 
-(defun db:entity-in-parts-p (ename parts / found part)
+(defun db:bbox-inset (bbox inset / w h)
+  (setq inset (max 0.0 inset))
+  (setq w (db:bbox-width bbox))
+  (setq h (db:bbox-height bbox))
+  (if (and (> w (* 2.0 inset))
+           (> h (* 2.0 inset)))
+    (list
+      (+ (nth 0 bbox) inset)
+      (+ (nth 1 bbox) inset)
+      (- (nth 2 bbox) inset)
+      (- (nth 3 bbox) inset)
+    )
+    bbox
+  )
+)
+
+(defun db:sheet-placement-bbox (sheet-bbox gap)
+  (db:bbox-inset sheet-bbox gap)
+)
+
+(defun db:normalize-sheet-gap (sheet-gap)
+  (if (and sheet-gap (> sheet-gap 0.0))
+    sheet-gap
+    50.0
+  )
+)
+
+(defun db:entity-in-parts-p (ename parts / found part en)
   (setq found nil)
   (foreach part parts
-    (if (eq ename (car part))
-      (setq found T)
+    (foreach en (car part)
+      (if (eq ename en)
+        (setq found T)
+      )
     )
   )
   found
@@ -2470,7 +2655,20 @@
   (setq i 0)
   (foreach board boards
     (if (= i index)
-      (setq result (cons (list (car board) occupied) result))
+      (setq result (cons (list (car board) occupied (nth 2 board)) result))
+      (setq result (cons board result))
+    )
+    (setq i (1+ i))
+  )
+  (reverse result)
+)
+
+(defun db:update-board-state (boards index occupied free-rects / result i board)
+  (setq result '())
+  (setq i 0)
+  (foreach board boards
+    (if (= i index)
+      (setq result (cons (list (car board) occupied free-rects) result))
       (setq result (cons board result))
     )
     (setq i (1+ i))
@@ -2494,39 +2692,112 @@
   (cond
     ((= etype "LWPOLYLINE") (db:lwpoly-bbox ename))
     ((= etype "INSERT")     (db:insert-bbox ename))
+    ((= etype "CIRCLE")     (db:circle-bbox ename))
     (T nil)
   )
 )
 
 ;;; ---------------------------------------------------------------------------
 ;;; db:collect-nest-parts  —  Prompt user to select parts and compute AABBs
-;;; Returns list of (ename bbox width height area entity-type)
+;;; Returns list of ((ename ...) bbox width height area entity-type)
 ;;; ---------------------------------------------------------------------------
-(defun db:collect-nest-parts (/ ss i n en bbox w h a etype parts)
-  (prompt "\n选择要排料的零件 (LWPOLYLINE 或 INSERT): ")
-  (setq ss (ssget '((0 . "LWPOLYLINE,INSERT"))))
+(defun db:bbox-contains-bbox-p (outer inner /)
+  (and
+    (<= (nth 0 outer) (+ (nth 0 inner) *db-eps*))
+    (<= (nth 1 outer) (+ (nth 1 inner) *db-eps*))
+    (>= (nth 2 outer) (- (nth 2 inner) *db-eps*))
+    (>= (nth 3 outer) (- (nth 3 inner) *db-eps*))
+  )
+)
+
+(defun db:bbox-union (a b /)
+  (list
+    (min (nth 0 a) (nth 0 b))
+    (min (nth 1 a) (nth 1 b))
+    (max (nth 2 a) (nth 2 b))
+    (max (nth 3 a) (nth 3 b))
+  )
+)
+
+(defun db:nest-item-parent (item items / parent parent-area item-en item-bbox item-area other other-en other-bbox other-area)
+  (setq parent nil)
+  (setq parent-area nil)
+  (setq item-en (car item))
+  (setq item-bbox (cadr item))
+  (setq item-area (caddr item))
+  (foreach other items
+    (setq other-en (car other))
+    (setq other-bbox (cadr other))
+    (setq other-area (caddr other))
+    (if (and
+          (not (eq item-en other-en))
+          (> other-area (+ item-area *db-eps*))
+          (db:bbox-contains-bbox-p other-bbox item-bbox)
+          (or (not parent-area) (< other-area parent-area)))
+      (progn
+        (setq parent other-en)
+        (setq parent-area other-area)
+      )
+    )
+  )
+  parent
+)
+
+(defun db:group-nest-items (items / parts item parent root-en root-bbox entities bbox child child-parent w h a)
+  (setq parts '())
+  (foreach item items
+    (setq parent (db:nest-item-parent item items))
+    (if (not parent)
+      (progn
+        (setq root-en (car item))
+        (setq root-bbox (cadr item))
+        (setq entities (list root-en))
+        (setq bbox root-bbox)
+        (foreach child items
+          (setq child-parent (db:nest-item-parent child items))
+          (if (eq child-parent root-en)
+            (progn
+              (setq entities (append entities (list (car child))))
+              (setq bbox (db:bbox-union bbox (cadr child)))
+            )
+          )
+        )
+        (setq w (db:bbox-width bbox))
+        (setq h (db:bbox-height bbox))
+        (setq a (db:bbox-area bbox))
+        (setq parts (cons (list entities bbox w h a "GROUP") parts))
+      )
+    )
+  )
+  (reverse parts)
+)
+
+(defun db:collect-nest-parts (/ ss i n en bbox a etype items parts)
+  (prompt "\n选择要排料的零件 (LWPOLYLINE、INSERT 或 CIRCLE): ")
+  (setq ss (ssget '((0 . "LWPOLYLINE,INSERT,CIRCLE"))))
   (if (not ss)
     nil
     (progn
-      (setq parts '())
+      (setq items '())
       (setq i 0)
       (setq n (sslength ss))
+      (setq *db-last-nest-raw-count* n)
       (while (< i n)
         (setq en (ssname ss i))
         (setq bbox (db:entity-aabb en))
         (if bbox
           (progn
-            (setq w (db:bbox-width bbox))
-            (setq h (db:bbox-height bbox))
             (setq a (db:bbox-area bbox))
             (setq etype (cdr (assoc 0 (entget en))))
-            (setq parts (cons (list en bbox w h a etype) parts))
+            (setq items (cons (list en bbox a etype) items))
           )
           (prompt (strcat "\n警告: 第 " (itoa (1+ i)) " 个实体无法计算 AABB，已跳过。"))
         )
         (setq i (1+ i))
       )
-      (reverse parts)
+      (setq parts (db:group-nest-items (reverse items)))
+      (setq *db-last-nest-group-count* (length parts))
+      parts
     )
   )
 )
@@ -2593,7 +2864,7 @@
                                     / minpt maxpt ss i n en bbox obstacles)
   (setq minpt (list (nth 0 sheet-bbox) (nth 1 sheet-bbox) 0.0))
   (setq maxpt (list (nth 2 sheet-bbox) (nth 3 sheet-bbox) 0.0))
-  (setq ss (ssget "_C" minpt maxpt '((0 . "LWPOLYLINE,INSERT"))))
+  (setq ss (ssget "_C" minpt maxpt '((0 . "LWPOLYLINE,INSERT,CIRCLE"))))
   (setq obstacles '())
   (if ss
     (progn
@@ -2621,7 +2892,18 @@
 ;;; db:sort-by-area-desc  —  Sort parts by area (5th element) descending
 ;;; Simple insertion sort for AutoLISP compatibility
 ;;; ---------------------------------------------------------------------------
-(defun db:sort-by-area-desc (parts / sorted rest item inserted tmp result)
+(defun db:part-sort-value (part mode / w h)
+  (setq w (nth 2 part))
+  (setq h (nth 3 part))
+  (cond
+    ((= mode "WIDTH") w)
+    ((= mode "HEIGHT") h)
+    ((= mode "LONG") (max w h))
+    (T (nth 4 part))
+  )
+)
+
+(defun db:sort-by-mode-desc (parts mode / sorted rest item inserted tmp result)
   (setq sorted '())
   (setq rest parts)
   (while rest
@@ -2633,7 +2915,7 @@
     (setq result '())
     (setq tmp sorted)
     (while (and tmp (not inserted))
-      (if (>= (nth 4 (car tmp)) (nth 4 item))
+      (if (>= (db:part-sort-value (car tmp) mode) (db:part-sort-value item mode))
         (progn
           (setq result (cons (car tmp) result))
           (setq tmp (cdr tmp))
@@ -2649,6 +2931,19 @@
     (setq sorted (reverse result))
   )
   sorted
+)
+
+(defun db:sort-by-area-desc (parts)
+  (db:sort-by-mode-desc parts "AREA")
+)
+
+(defun db:nest-sort-variants (parts)
+  (list
+    (list "AREA" (db:sort-by-mode-desc parts "AREA"))
+    (list "WIDTH" (db:sort-by-mode-desc parts "WIDTH"))
+    (list "HEIGHT" (db:sort-by-mode-desc parts "HEIGHT"))
+    (list "LONG" (db:sort-by-mode-desc parts "LONG"))
+  )
 )
 
 (defun db:part-orientations (part / w h)
@@ -2694,28 +2989,271 @@
   blocked
 )
 
+(defun db:bbox-list-union (bboxes / union b)
+  (setq union nil)
+  (foreach b bboxes
+    (if b
+      (if union
+        (setq union (db:bbox-union union b))
+        (setq union b)
+      )
+    )
+  )
+  union
+)
+
+(defun db:score-better-p (score best-score / better decided i a b)
+  (if (not best-score)
+    T
+    (progn
+      (setq better nil)
+      (setq decided nil)
+      (setq i 0)
+      (while (and (not decided) (< i (length score)))
+        (setq a (nth i score))
+        (setq b (nth i best-score))
+        (if (< a (- b *db-eps*))
+          (progn
+            (setq better T)
+            (setq decided T)
+          )
+          (if (> a (+ b *db-eps*))
+            (progn
+              (setq better nil)
+              (setq decided T)
+            )
+          )
+        )
+        (setq i (1+ i))
+      )
+      better
+    )
+  )
+)
+
+(defun db:placement-score (candidate occupied sheet-bbox / union used-w used-h)
+  (setq union (db:bbox-list-union (cons candidate occupied)))
+  (setq used-w (- (nth 2 union) (nth 0 sheet-bbox)))
+  (setq used-h (- (nth 3 union) (nth 1 sheet-bbox)))
+  (list
+    (* used-w used-h)
+    used-h
+    used-w
+    (- (nth 1 candidate) (nth 1 sheet-bbox))
+    (- (nth 0 candidate) (nth 0 sheet-bbox))
+  )
+)
+
 (defun db:find-placement (part sheet-bbox gap occupied
-                          / orientations orient angle pw ph xs ys x y candidate placement)
+                          / orientations orient angle pw ph xs ys x y candidate score best-score placement)
   (setq placement nil)
+  (setq best-score nil)
   (setq orientations (db:part-orientations part))
   (setq xs (db:candidate-xs sheet-bbox occupied gap))
   (setq ys (db:candidate-ys sheet-bbox occupied gap))
   (foreach y ys
     (foreach x xs
       (foreach orient orientations
-        (if (not placement)
+        (progn
+          (setq angle (car orient))
+          (setq pw (cadr orient))
+          (setq ph (caddr orient))
+          (setq candidate (db:bbox-make x y pw ph))
+          (if (and
+                (<= (nth 0 sheet-bbox) (+ (nth 0 candidate) *db-eps*))
+                (<= (nth 1 sheet-bbox) (+ (nth 1 candidate) *db-eps*))
+                (<= (nth 2 candidate) (+ (nth 2 sheet-bbox) *db-eps*))
+                (<= (nth 3 candidate) (+ (nth 3 sheet-bbox) *db-eps*))
+                (not (db:placement-blocked-p candidate occupied gap)))
           (progn
-            (setq angle (car orient))
-            (setq pw (cadr orient))
-            (setq ph (caddr orient))
-            (setq candidate (db:bbox-make x y pw ph))
-            (if (and
-                  (<= (nth 0 sheet-bbox) (+ (nth 0 candidate) *db-eps*))
-                  (<= (nth 1 sheet-bbox) (+ (nth 1 candidate) *db-eps*))
-                  (<= (nth 2 candidate) (+ (nth 2 sheet-bbox) *db-eps*))
-                  (<= (nth 3 candidate) (+ (nth 3 sheet-bbox) *db-eps*))
-                  (not (db:placement-blocked-p candidate occupied gap)))
-              (setq placement (list x y angle candidate))
+            (setq score (db:placement-score candidate occupied sheet-bbox))
+            (if (db:score-better-p score best-score)
+              (progn
+                (setq best-score score)
+                (setq placement (list x y angle candidate))
+              )
+            )
+          )
+        )
+        )
+      )
+    )
+  )
+  placement
+)
+
+(defun db:maxrect-bbox-valid-p (bbox)
+  (and
+    bbox
+    (> (db:bbox-width bbox) *db-eps*)
+    (> (db:bbox-height bbox) *db-eps*)
+  )
+)
+
+(defun db:maxrect-inflate-bbox (bbox gap /)
+  (list
+    (- (nth 0 bbox) gap)
+    (- (nth 1 bbox) gap)
+    (+ (nth 2 bbox) gap)
+    (+ (nth 3 bbox) gap)
+  )
+)
+
+(defun db:maxrect-split-free-rect (free blocker / pieces r)
+  (setq pieces '())
+  (if (not (db:bbox-overlaps free blocker))
+    (list free)
+    (progn
+      (setq r (list (nth 0 free) (nth 1 free) (nth 0 blocker) (nth 3 free)))
+      (if (db:maxrect-bbox-valid-p r) (setq pieces (cons r pieces)))
+      (setq r (list (nth 2 blocker) (nth 1 free) (nth 2 free) (nth 3 free)))
+      (if (db:maxrect-bbox-valid-p r) (setq pieces (cons r pieces)))
+      (setq r (list (nth 0 free) (nth 1 free) (nth 2 free) (nth 1 blocker)))
+      (if (db:maxrect-bbox-valid-p r) (setq pieces (cons r pieces)))
+      (setq r (list (nth 0 free) (nth 3 blocker) (nth 2 free) (nth 3 free)))
+      (if (db:maxrect-bbox-valid-p r) (setq pieces (cons r pieces)))
+      pieces
+    )
+  )
+)
+
+(defun db:maxrect-contained-p (inner outer /)
+  (and
+    (<= (nth 0 outer) (+ (nth 0 inner) *db-eps*))
+    (<= (nth 1 outer) (+ (nth 1 inner) *db-eps*))
+    (>= (nth 2 outer) (- (nth 2 inner) *db-eps*))
+    (>= (nth 3 outer) (- (nth 3 inner) *db-eps*))
+  )
+)
+
+(defun db:maxrect-prune-free-rects (free-rects / pruned rect other contained)
+  (setq pruned '())
+  (foreach rect free-rects
+    (if (db:maxrect-bbox-valid-p rect)
+      (progn
+        (setq contained nil)
+        (foreach other free-rects
+          (if (and
+                (not (equal rect other))
+                (db:maxrect-bbox-valid-p other)
+                (db:maxrect-contained-p rect other))
+            (setq contained T)
+          )
+        )
+        (if (not contained)
+          (setq pruned (cons rect pruned))
+        )
+      )
+    )
+  )
+  (reverse pruned)
+)
+
+(defun db:maxrect-subtract-blocker (free-rects blocker / result rect pieces)
+  (setq result '())
+  (foreach rect free-rects
+    (setq pieces (db:maxrect-split-free-rect rect blocker))
+    (foreach piece pieces
+      (setq result (cons piece result))
+    )
+  )
+  (db:maxrect-prune-free-rects result)
+)
+
+(defun db:maxrect-update-free-rects (free-rects candidate gap / blocker)
+  (setq blocker (db:maxrect-inflate-bbox candidate gap))
+  (db:maxrect-subtract-blocker free-rects blocker)
+)
+
+(defun db:maxrect-init-free-rects (sheet-placement-bbox obstacles gap / free-rects obstacle)
+  (setq free-rects (list sheet-placement-bbox))
+  (foreach obstacle obstacles
+    (setq free-rects
+      (db:maxrect-subtract-blocker free-rects (db:maxrect-inflate-bbox obstacle gap))
+    )
+  )
+  free-rects
+)
+
+(defun db:maxrect-anchors ()
+  (list "LB" "RB" "LT" "RT")
+)
+
+(defun db:maxrect-anchor-candidate (free width height anchor / x y)
+  (setq x
+    (if (or (= anchor "RB") (= anchor "RT"))
+      (- (nth 2 free) width)
+      (nth 0 free)
+    )
+  )
+  (setq y
+    (if (or (= anchor "LT") (= anchor "RT"))
+      (- (nth 3 free) height)
+      (nth 1 free)
+    )
+  )
+  (db:bbox-make x y width height)
+)
+
+(defun db:maxrect-largest-free-area (free-rects / largest rect area)
+  (setq largest 0.0)
+  (foreach rect free-rects
+    (setq area (db:bbox-area rect))
+    (if (> area largest)
+      (setq largest area)
+    )
+  )
+  largest
+)
+
+(defun db:maxrect-placement-score (candidate free updated-free-rects / leftover-w leftover-h short-side long-side)
+  (setq leftover-w (- (db:bbox-width free) (db:bbox-width candidate)))
+  (setq leftover-h (- (db:bbox-height free) (db:bbox-height candidate)))
+  (setq short-side (min leftover-w leftover-h))
+  (setq long-side (max leftover-w leftover-h))
+  (list
+    (- (db:bbox-area free) (db:bbox-area candidate))
+    short-side
+    long-side
+    (length updated-free-rects)
+    (- 0.0 (db:maxrect-largest-free-area updated-free-rects))
+    (nth 1 candidate)
+    (nth 0 candidate)
+  )
+)
+
+(defun db:maxrect-find-placement (part free-rects gap
+                                  / orientations anchors anchor orient free angle pw ph candidate updated-free-rects score best-score placement)
+  (setq placement nil)
+  (setq best-score nil)
+  (setq orientations (db:part-orientations part))
+  (setq anchors (db:maxrect-anchors))
+  (foreach free free-rects
+    (foreach anchor anchors
+      (foreach orient orientations
+        (setq angle (car orient))
+        (setq pw (cadr orient))
+        (setq ph (caddr orient))
+        (if (and
+              (<= pw (+ (db:bbox-width free) *db-eps*))
+              (<= ph (+ (db:bbox-height free) *db-eps*)))
+          (progn
+            (setq candidate (db:maxrect-anchor-candidate free pw ph anchor))
+            (setq updated-free-rects (db:maxrect-update-free-rects free-rects candidate gap))
+            (setq score (db:maxrect-placement-score candidate free updated-free-rects))
+            (if (db:score-better-p score best-score)
+              (progn
+                (setq best-score score)
+                (setq placement
+                  (list
+                    (nth 0 candidate)
+                    (nth 1 candidate)
+                    angle
+                    candidate
+                    updated-free-rects
+                  )
+                )
+              )
             )
           )
         )
@@ -2757,6 +3295,7 @@
 )
 
 (defun db:sheet-bbox-at-index (template-bbox sheet-gap index / step)
+  (setq sheet-gap (db:normalize-sheet-gap sheet-gap))
   (setq step (+ (db:bbox-width template-bbox) sheet-gap))
   (db:bbox-offset template-bbox (* index step) 0.0)
 )
@@ -2776,10 +3315,20 @@
   (list index candidate)
 )
 
-(defun db:multi-sheet-pack (parts template-bbox gap sheet-gap initial-obstacles
+(defun db:multi-sheet-pack (parts template-bbox gap edge-margin sheet-gap initial-obstacles
                             / boards results part placed board-index board placement
-                              occupied candidate new-index new-bbox new-sheet occupied-sheet-bboxes)
-  (setq boards (list (list template-bbox initial-obstacles)))
+                              occupied candidate free-rects new-index new-bbox new-sheet
+                              new-free-rects occupied-sheet-bboxes)
+  (setq sheet-gap (db:normalize-sheet-gap sheet-gap))
+  (setq boards
+    (list
+      (list
+        template-bbox
+        initial-obstacles
+        (db:maxrect-init-free-rects (db:sheet-placement-bbox template-bbox edge-margin) initial-obstacles gap)
+      )
+    )
+  )
   (setq occupied-sheet-bboxes (list template-bbox))
   (setq results '())
   (foreach part parts
@@ -2788,13 +3337,14 @@
     (foreach board boards
       (if (not placed)
         (progn
-          (setq placement (db:find-placement part (car board) gap (cadr board)))
+          (setq placement (db:maxrect-find-placement part (nth 2 board) gap))
           (if placement
             (progn
               (setq placed T)
               (setq occupied (cadr board))
               (setq candidate (cadddr placement))
-              (setq boards (db:update-board-occupied boards board-index (cons candidate occupied)))
+              (setq free-rects (nth 4 placement))
+              (setq boards (db:update-board-state boards board-index (cons candidate occupied) free-rects))
               (setq results
                 (cons
                   (list
@@ -2819,12 +3369,15 @@
         (setq new-sheet (db:find-empty-sheet-bbox template-bbox sheet-gap occupied-sheet-bboxes (length boards)))
         (setq new-index (car new-sheet))
         (setq new-bbox (cadr new-sheet))
-        (setq placement (db:find-placement part new-bbox gap '()))
+        (setq placement
+          (db:maxrect-find-placement part (db:maxrect-init-free-rects (db:sheet-placement-bbox new-bbox edge-margin) '() gap) gap)
+        )
         (if placement
           (progn
             (setq candidate (cadddr placement))
+            (setq new-free-rects (nth 4 placement))
             (setq occupied-sheet-bboxes (append occupied-sheet-bboxes (list new-bbox)))
-            (setq boards (append boards (list (list new-bbox (list candidate)))))
+            (setq boards (append boards (list (list new-bbox (list candidate) new-free-rects))))
             (setq results
               (cons
                 (list
@@ -2845,6 +3398,224 @@
     )
   )
   (list (reverse results) boards)
+)
+
+(defun db:result-board-index (result)
+  (nth 4 result)
+)
+
+(defun db:tail-board-index (results / tail r idx)
+  (setq tail 0)
+  (foreach r results
+    (if (nth 5 r)
+      (progn
+        (setq idx (db:result-board-index r))
+        (if (> idx tail)
+          (setq tail idx)
+        )
+      )
+    )
+  )
+  tail
+)
+
+(defun db:tail-board-results (results / tail tail-results r)
+  (setq tail (db:tail-board-index results))
+  (setq tail-results '())
+  (foreach r results
+    (if (and (nth 5 r) (= (db:result-board-index r) tail))
+      (setq tail-results (cons r tail-results))
+    )
+  )
+  (reverse tail-results)
+)
+
+(defun db:non-tail-board-results (results / tail kept r)
+  (setq tail (db:tail-board-index results))
+  (setq kept '())
+  (foreach r results
+    (if (not (and (nth 5 r) (= (db:result-board-index r) tail)))
+      (setq kept (cons r kept))
+    )
+  )
+  (reverse kept)
+)
+
+(defun db:drop-last-board (boards / kept remaining)
+  (setq kept '())
+  (setq remaining boards)
+  (while (cdr remaining)
+    (setq kept (cons (car remaining) kept))
+    (setq remaining (cdr remaining))
+  )
+  (reverse kept)
+)
+
+(defun db:result-part (result / entities bbox)
+  (setq entities (car result))
+  (setq bbox (db:entities-aabb entities))
+  (if bbox
+    (list
+      entities
+      bbox
+      (db:bbox-width bbox)
+      (db:bbox-height bbox)
+      (db:bbox-area bbox)
+      "GROUP"
+    )
+    nil
+  )
+)
+
+(defun db:try-place-result-on-earlier-board (result boards tail-index gap
+                                             / part board-index board placement occupied candidate free-rects)
+  (setq part (db:result-part result))
+  (setq board-index 0)
+  (setq placement nil)
+  (while (and part (not placement) (< board-index tail-index) (< board-index (length boards)))
+    (setq board (nth board-index boards))
+    (setq placement (db:maxrect-find-placement part (nth 2 board) gap))
+    (if placement
+      (progn
+        (setq occupied (cadr board))
+        (setq candidate (cadddr placement))
+        (setq free-rects (nth 4 placement))
+        (setq boards (db:update-board-state boards board-index (cons candidate occupied) free-rects))
+      )
+      (setq board-index (1+ board-index))
+    )
+  )
+  (if placement
+    (list
+      T
+      boards
+      (list
+        (car result)
+        (car placement)
+        (cadr placement)
+        (caddr placement)
+        board-index
+        T
+      )
+    )
+    (list nil boards result)
+  )
+)
+
+(defun db:compact-tail-board (packed gap / results boards tail-index tail-results kept-results moved-results
+                                     working-boards ok attempt r)
+  (setq results (car packed))
+  (setq boards (cadr packed))
+  (setq *db-last-tail-compact-before* (length boards))
+  (setq *db-last-tail-compact-after* (length boards))
+  (setq *db-last-tail-compact-count* 0)
+  (setq *db-last-tail-compact-status* "SKIPPED")
+  (setq tail-index (db:tail-board-index results))
+  (if (or (<= (length boards) 1)
+          (<= tail-index 0)
+          (/= tail-index (1- (length boards))))
+    packed
+    (progn
+      (setq tail-results (db:tail-board-results results))
+      (setq kept-results (db:non-tail-board-results results))
+      (setq moved-results '())
+      (setq working-boards boards)
+      (setq ok T)
+      (foreach r tail-results
+        (if ok
+          (progn
+            (setq attempt (db:try-place-result-on-earlier-board r working-boards tail-index gap))
+            (if (car attempt)
+              (progn
+                (setq working-boards (cadr attempt))
+                (setq moved-results (cons (caddr attempt) moved-results))
+              )
+              (setq ok nil)
+            )
+          )
+        )
+      )
+      (if ok
+        (progn
+          (setq *db-last-tail-compact-status* "REMOVED")
+          (setq *db-last-tail-compact-count* (length tail-results))
+          (setq *db-last-tail-compact-after* (length (db:drop-last-board working-boards)))
+          (list
+            (append kept-results (reverse moved-results))
+            (db:drop-last-board working-boards)
+          )
+        )
+        (progn
+          (setq *db-last-tail-compact-status* "FAILED")
+          (setq *db-last-tail-compact-count* (length tail-results))
+          packed
+        )
+      )
+    )
+  )
+)
+
+(defun db:pack-score (packed / results boards unplaced used-area used-w used-h board union score-board r)
+  (setq results (car packed))
+  (setq boards (cadr packed))
+  (setq unplaced 0)
+  (foreach r results
+    (if (not (nth 5 r))
+      (setq unplaced (1+ unplaced))
+    )
+  )
+  (setq used-area 0.0)
+  (setq used-w 0.0)
+  (setq used-h 0.0)
+  (foreach board boards
+    (setq union (db:bbox-list-union (cadr board)))
+    (if union
+      (progn
+        (setq score-board (car board))
+        (setq used-area (+ used-area (db:bbox-area union)))
+        (setq used-w (+ used-w (- (nth 2 union) (nth 0 score-board))))
+        (setq used-h (+ used-h (- (nth 3 union) (nth 1 score-board))))
+      )
+    )
+  )
+  (list unplaced (length boards) used-area used-h used-w)
+)
+
+(defun db:multi-sheet-pack-best (parts template-bbox gap edge-margin sheet-gap initial-obstacles
+                                 / variants variant label sorted packed compacted score best best-score best-label
+                                   best-compact-status best-compact-before best-compact-after best-compact-count)
+  (setq variants (db:nest-sort-variants parts))
+  (setq best nil)
+  (setq best-score nil)
+  (setq best-label "AREA")
+  (setq best-compact-status "SKIPPED")
+  (setq best-compact-before 0)
+  (setq best-compact-after 0)
+  (setq best-compact-count 0)
+  (foreach variant variants
+    (setq label (car variant))
+    (setq sorted (cadr variant))
+    (setq packed (db:multi-sheet-pack sorted template-bbox gap edge-margin sheet-gap initial-obstacles))
+    (setq compacted (db:compact-tail-board packed gap))
+    (setq *db-last-tail-compact-after* (length (cadr compacted)))
+    (setq score (db:pack-score compacted))
+    (if (db:score-better-p score best-score)
+      (progn
+        (setq best compacted)
+        (setq best-score score)
+        (setq best-label label)
+        (setq best-compact-status *db-last-tail-compact-status*)
+        (setq best-compact-before *db-last-tail-compact-before*)
+        (setq best-compact-after *db-last-tail-compact-after*)
+        (setq best-compact-count *db-last-tail-compact-count*)
+      )
+    )
+  )
+  (setq *db-last-tail-compact-status* best-compact-status)
+  (setq *db-last-tail-compact-before* best-compact-before)
+  (setq *db-last-tail-compact-after* best-compact-after)
+  (setq *db-last-tail-compact-count* best-compact-count)
+  (list (car best) (cadr best) best-label best-score)
 )
 
 ;;; ---------------------------------------------------------------------------
@@ -2929,20 +3700,60 @@
 ;;; db:move-entity-to  —  Move an entity from one point to another
 ;;; ---------------------------------------------------------------------------
 (defun db:move-entity-to (ename from-pt to-pt)
-  (command "_.MOVE" ename "" from-pt to-pt)
+  (command "_.MOVE" ename "" "_non" from-pt "_non" to-pt)
 )
 
 (defun db:rotate-entity-90 (ename bbox / base)
   (setq base (list (nth 0 bbox) (nth 1 bbox) 0.0))
-  (command "_.ROTATE" ename "" base "90")
+  (command "_.ROTATE" ename "" "_non" base "90")
 )
 
 (defun db:copy-sheet-frame (sheet-en source-bbox target-bbox / from-pt to-pt copied)
   (setq from-pt (list (nth 0 source-bbox) (nth 1 source-bbox) 0.0))
   (setq to-pt (list (nth 0 target-bbox) (nth 1 target-bbox) 0.0))
-  (command "_.COPY" sheet-en "" from-pt to-pt)
+  (command "_.COPY" sheet-en "" "_non" from-pt "_non" to-pt)
   (setq copied (entlast))
   copied
+)
+
+(defun db:entities-aabb (entities / bbox en ebbox)
+  (setq bbox nil)
+  (foreach en entities
+    (setq ebbox (db:entity-aabb en))
+    (if ebbox
+      (if bbox
+        (setq bbox (db:bbox-union bbox ebbox))
+        (setq bbox ebbox)
+      )
+    )
+  )
+  bbox
+)
+
+(defun db:rotate-entities-90 (entities bbox / base en)
+  (setq base (list (nth 0 bbox) (nth 1 bbox) 0.0))
+  (foreach en entities
+    (command "_.ROTATE" en "" "_non" base "90")
+  )
+)
+
+(defun db:place-nested-part (entities tx ty angle / bbox from-pt to-pt en)
+  (setq bbox (db:entities-aabb entities))
+  (if bbox
+    (progn
+      (if (= angle 90)
+        (progn
+          (db:rotate-entities-90 entities bbox)
+          (setq bbox (db:entities-aabb entities))
+        )
+      )
+      (setq from-pt (list (nth 0 bbox) (nth 1 bbox) 0.0))
+      (setq to-pt (list tx ty 0.0))
+      (foreach en entities
+        (db:move-entity-to en from-pt to-pt)
+      )
+    )
+  )
 )
 
 (defun db:place-nested-entity (en tx ty angle / bbox from-pt to-pt)
@@ -2961,114 +3772,30 @@
 ;;; ---------------------------------------------------------------------------
 ;;; c:DBNSET  —  Set nesting gap parameter
 ;;; ---------------------------------------------------------------------------
-(defun c:DBNSET (/ g)
-  (prompt (strcat "\n当前排料间距: " (rtos *db-nest-gap* 2 2) " mm"))
+(defun c:DBNSET (/ g m)
+  (prompt (strcat "\n当前组件间距: " (rtos *db-nest-gap* 2 2) " mm"))
+  (prompt (strcat "\n当前边缘留边: " (rtos *db-nest-edge-margin* 2 2) " mm"))
   (setq g (getreal (strcat "\n输入新的排料间距 <" (rtos *db-nest-gap* 2 2) ">: ")))
   (if (and g (>= g 0.0))
     (setq *db-nest-gap* g)
   )
-  (prompt (strcat "\n排料间距已设为: " (rtos *db-nest-gap* 2 2) " mm"))
+  (setq m (getreal (strcat "\n输入新的边缘留边 <" (rtos *db-nest-edge-margin* 2 2) ">: ")))
+  (if (and m (>= m 0.0))
+    (setq *db-nest-edge-margin* m)
+  )
+  (prompt (strcat "\n组件间距已设为: " (rtos *db-nest-gap* 2 2) " mm"))
+  (prompt (strcat "\n边缘留边已设为: " (rtos *db-nest-edge-margin* 2 2) " mm"))
   (princ)
 )
 
 ;;; ---------------------------------------------------------------------------
-;;; c:DBNEST  —  Main nesting command
+;;; db:run-multi-sheet-nest  —  Shared multi-sheet nesting command runner
 ;;; ---------------------------------------------------------------------------
-(defun c:DBNEST (/ olderr parts sheet sheet-en sheet-bbox obstacles sorted results
-                   total-count placed-count remain-count
-                   r en tx ty angle placed bbox from-pt to-pt)
-  (setq olderr *error*)
-  (defun *error* (msg)
-    (db:end-undo)
-    (setq *error* olderr)
-    (if (and msg (/= msg "Function cancelled"))
-      (prompt (strcat "\nError: " msg))
-    )
-    (princ)
-  )
-  (db:start-undo)
-  ;; Step 1: Collect parts
-  (setq parts (db:collect-nest-parts))
-  (if (or (not parts) (null parts))
-    (progn
-      (prompt "\n未选择任何有效零件。")
-      (db:end-undo)
-      (setq *error* olderr)
-      (princ)
-    )
-    (progn
-      ;; Step 2: Select sheet
-      (setq sheet (db:select-sheet))
-      (if (not sheet)
-        (progn
-          (prompt "\n板框选择失败，操作取消。")
-          (db:end-undo)
-          (setq *error* olderr)
-          (princ)
-        )
-        (progn
-          (setq sheet-en (car sheet))
-          (setq sheet-bbox (cadr sheet))
-          (setq obstacles (db:collect-sheet-obstacles sheet-en sheet-bbox parts))
-          ;; Step 3: Sort by area descending
-          (setq sorted (db:sort-by-area-desc parts))
-          (prompt (strcat "\n开始排料... 零件数: " (itoa (length sorted))
-                          ", 已占用: " (itoa (length obstacles))
-                          ", 间距: " (rtos *db-nest-gap* 2 2)))
-          ;; Step 4: Run obstacle-aware packing
-          (setq results (db:bottom-left-pack sorted sheet-bbox *db-nest-gap* obstacles))
-          ;; Step 5: Move placed parts
-          (setq total-count (length results))
-          (setq placed-count 0)
-          (setq remain-count 0)
-          (foreach r results
-            (setq en (car r))
-            (setq tx (cadr r))
-            (setq ty (caddr r))
-            (setq angle (cadddr r))
-            (setq placed (nth 4 r))
-            (if placed
-              (progn
-                (setq bbox (db:entity-aabb en))
-                (if (= angle 90)
-                  (progn
-                    (db:rotate-entity-90 en bbox)
-                    (setq bbox (db:entity-aabb en))
-                  )
-                )
-                (setq from-pt (list (nth 0 bbox) (nth 1 bbox) 0.0))
-                (setq to-pt (list tx ty 0.0))
-                (db:move-entity-to en from-pt to-pt)
-                (setq placed-count (1+ placed-count))
-              )
-              (setq remain-count (1+ remain-count))
-            )
-          )
-          ;; Step 6: Report
-          (prompt
-            (strcat
-              "\nDBNEST 完成。共 " (itoa total-count)
-              " 个零件，已排入 " (itoa placed-count)
-              " 个，剩余 " (itoa remain-count)
-              " 个未排入。"
-            )
-          )
-          (db:end-undo)
-          (setq *error* olderr)
-          (princ)
-        )
-      )
-    )
-  )
-)
-
-;;; ---------------------------------------------------------------------------
-;;; c:DBNESTM  —  Multi-sheet nesting command
-;;; ---------------------------------------------------------------------------
-(defun c:DBNESTM (/ olderr parts sheet sheet-en sheet-bbox obstacles sorted
-                    sheet-gap packed results boards board-count
-                    total-count placed-count remain-count copy-index board
-                    r en tx ty angle placed gap-input)
+(defun db:run-multi-sheet-nest (command-name
+                                / olderr parts sheet sheet-en sheet-bbox obstacles
+                                  sheet-gap packed results boards board-count strategy
+                                  total-count placed-count remain-count copy-index board
+                                  r en tx ty angle placed gap-input)
   (setq olderr *error*)
   (defun *error* (msg)
     (db:end-undo)
@@ -3099,6 +3826,7 @@
         (progn
           (setq sheet-en (car sheet))
           (setq sheet-bbox (cadr sheet))
+          (setq *db-nest-sheet-gap* (db:normalize-sheet-gap *db-nest-sheet-gap*))
           (setq gap-input
             (getreal
               (strcat
@@ -3108,23 +3836,43 @@
               )
             )
           )
-          (if (and gap-input (>= gap-input 0.0))
+          (if (and gap-input (> gap-input 0.0))
             (setq *db-nest-sheet-gap* gap-input)
           )
           (setq sheet-gap *db-nest-sheet-gap*)
           (setq obstacles (db:collect-sheet-obstacles sheet-en sheet-bbox parts))
-          (setq sorted (db:sort-by-area-desc parts))
           (prompt
             (strcat
-              "\n开始多板排料... 零件数: " (itoa (length sorted))
+              "\nDBNEST-DIAG version=" *db-version*
+              ", raw-selected=" (itoa *db-last-nest-raw-count*)
+              ", grouped-parts=" (itoa *db-last-nest-group-count*)
+              ", sheet-gap=" (rtos sheet-gap 2 2)
+              ", nest-gap=" (rtos *db-nest-gap* 2 2)
+              ", edge-margin=" (rtos *db-nest-edge-margin* 2 2)
+            )
+          )
+          (prompt
+            (strcat
+              "\n开始多板排料... 零件数: " (itoa (length parts))
               ", 首板已占用: " (itoa (length obstacles))
               ", 零件间距: " (rtos *db-nest-gap* 2 2)
+              ", 边缘留边: " (rtos *db-nest-edge-margin* 2 2)
               ", 板框间距: " (rtos sheet-gap 2 2)
             )
           )
-          (setq packed (db:multi-sheet-pack sorted sheet-bbox *db-nest-gap* sheet-gap obstacles))
+          (setq packed (db:multi-sheet-pack-best parts sheet-bbox *db-nest-gap* *db-nest-edge-margin* sheet-gap obstacles))
           (setq results (car packed))
           (setq boards (cadr packed))
+          (setq strategy (caddr packed))
+          (prompt (strcat "\nDBNEST-DIAG strategy=" strategy))
+          (prompt
+            (strcat
+              "\nDBNEST-DIAG tail-compact=" *db-last-tail-compact-status*
+              ", compact-before=" (itoa *db-last-tail-compact-before*)
+              ", compact-after=" (itoa *db-last-tail-compact-after*)
+              ", compact-tail-parts=" (itoa *db-last-tail-compact-count*)
+            )
+          )
           (setq board-count (length boards))
           (setq copy-index 1)
           (while (< copy-index board-count)
@@ -3143,7 +3891,7 @@
             (setq placed (nth 5 r))
             (if placed
               (progn
-                (db:place-nested-entity en tx ty angle)
+                (db:place-nested-part en tx ty angle)
                 (setq placed-count (1+ placed-count))
               )
               (setq remain-count (1+ remain-count))
@@ -3151,7 +3899,7 @@
           )
           (prompt
             (strcat
-              "\nDBNESTM 完成。共 " (itoa total-count)
+              "\n" command-name " 完成。共 " (itoa total-count)
               " 个零件，已排入 " (itoa placed-count)
               " 个，剩余 " (itoa remain-count)
               " 个未排入，使用板框 " (itoa board-count)
@@ -3167,5 +3915,19 @@
   )
 )
 
-(prompt (strcat "\nDogbone plugin " *db-version* " loaded. Commands: DBSET, DB1, DBDEBUG, DBAUTO, DBADD, DBRESTORE, DBRESTOREALL, DBNSET, DBNEST, DBNESTM."))
+;;; ---------------------------------------------------------------------------
+;;; c:DBNEST  —  Main nesting command
+;;; ---------------------------------------------------------------------------
+(defun c:DBNEST ()
+  (db:run-multi-sheet-nest "DBNEST")
+)
+
+;;; ---------------------------------------------------------------------------
+;;; c:DBNESTM  —  Multi-sheet nesting command
+;;; ---------------------------------------------------------------------------
+(defun c:DBNESTM ()
+  (db:run-multi-sheet-nest "DBNESTM")
+)
+
+(prompt (strcat "\nDogbone plugin " *db-version* " loaded. Commands: DBVER, DBSET, DB1, DBDEBUG, DBAUTO, DBADD, DBRESTORE, DBRESTOREALL, DBNSET, DBNEST, DBNESTM."))
 (princ)
