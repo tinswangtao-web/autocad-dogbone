@@ -33,6 +33,9 @@
 (setq *db-eps* 1.0e-8)
 (setq *db-circle-min-vertices* 24)
 (setq *db-circle-radius-tol* 0.001)
+(setq *db-polyarc-min-vertices* 5)
+(setq *db-polyarc-max-vertices* 48)
+(setq *db-polyarc-fit-tol* 0.05)
 (setq *db-nest-gap* 6.0)
 (setq *db-nest-edge-margin* 2.0)
 (setq *db-nest-sheet-gap* 50.0)
@@ -57,6 +60,9 @@
   (if (not *db-eps*) (setq *db-eps* 1.0e-8))
   (if (not *db-circle-min-vertices*) (setq *db-circle-min-vertices* 24))
   (if (not *db-circle-radius-tol*) (setq *db-circle-radius-tol* 0.001))
+  (if (not *db-polyarc-min-vertices*) (setq *db-polyarc-min-vertices* 5))
+  (if (not *db-polyarc-max-vertices*) (setq *db-polyarc-max-vertices* 48))
+  (if (not *db-polyarc-fit-tol*) (setq *db-polyarc-fit-tol* 0.05))
   (if (not *db-nest-gap*) (setq *db-nest-gap* 6.0))
   (if (not *db-nest-edge-margin*) (setq *db-nest-edge-margin* 2.0))
   (if (not *db-nest-sheet-gap*) (setq *db-nest-sheet-gap* 50.0))
@@ -176,17 +182,6 @@
   )
 )
 
-(defun db:min-distance-to-points (pt pts / best p d)
-  (setq best nil)
-  (foreach p pts
-    (setq d (db:distance pt p))
-    (if (or (not best) (< d best))
-      (setq best d)
-    )
-  )
-  best
-)
-
 (defun db:list-has-int (value values / found v)
   (setq found nil)
   (foreach v values
@@ -200,6 +195,157 @@
 (defun db:assoc-value (key alist default / found)
   (setq found (assoc key alist))
   (if found (cdr found) default)
+)
+
+(defun db:wrap-index (idx n)
+  (while (< idx 0)
+    (setq idx (+ idx n))
+  )
+  (rem idx n)
+)
+
+(defun db:indices-forward (start count n / i result)
+  (setq i 0)
+  (setq result '())
+  (while (< i count)
+    (setq result (cons (db:wrap-index (+ start i) n) result))
+    (setq i (1+ i))
+  )
+  (reverse result)
+)
+
+(defun db:points-for-indices (pts indices / result idx)
+  (setq result '())
+  (foreach idx indices
+    (setq result (cons (nth idx pts) result))
+  )
+  (reverse result)
+)
+
+(defun db:same-point-p (a b tol)
+  (<= (db:distance a b) tol)
+)
+
+(defun db:left-normal (v)
+  (list (- (db:y v)) (db:x v) 0.0)
+)
+
+(defun db:right-normal (v)
+  (list (db:y v) (- (db:x v)) 0.0)
+)
+
+(defun db:circle-from-fit-points (p1 p2 p3 / x1 y1 x2 y2 x3 y3 d ux uy center radius)
+  (setq x1 (db:x p1))
+  (setq y1 (db:y p1))
+  (setq x2 (db:x p2))
+  (setq y2 (db:y p2))
+  (setq x3 (db:x p3))
+  (setq y3 (db:y p3))
+  (setq d
+    (* 2.0
+      (+ (* x1 (- y2 y3))
+         (* x2 (- y3 y1))
+         (* x3 (- y1 y2)))
+    )
+  )
+  (if (<= (abs d) *db-eps*)
+    nil
+    (progn
+      (setq ux
+        (/
+          (+ (* (+ (* x1 x1) (* y1 y1)) (- y2 y3))
+             (* (+ (* x2 x2) (* y2 y2)) (- y3 y1))
+             (* (+ (* x3 x3) (* y3 y3)) (- y1 y2)))
+          d
+        )
+      )
+      (setq uy
+        (/
+          (+ (* (+ (* x1 x1) (* y1 y1)) (- x3 x2))
+             (* (+ (* x2 x2) (* y2 y2)) (- x1 x3))
+             (* (+ (* x3 x3) (* y3 y3)) (- x2 x1)))
+          d
+        )
+      )
+      (setq center (list ux uy 0.0))
+      (setq radius (db:distance center p1))
+      (if (> radius *db-eps*)
+        (list center radius)
+        nil
+      )
+    )
+  )
+)
+
+(defun db:fit-polyarc-points (arcpts / n first mid last circle center radius tol max-error
+                                     p q error i step step-sign direction total valid)
+  (setq n (length arcpts))
+  (if (< n *db-polyarc-min-vertices*)
+    nil
+    (progn
+      (setq first (car arcpts))
+      (setq mid (nth (fix (/ n 2)) arcpts))
+      (setq last (nth (1- n) arcpts))
+      (setq circle (db:circle-from-fit-points first mid last))
+      (if circle
+        (progn
+          (setq center (car circle))
+          (setq radius (cadr circle))
+          (setq tol (max *db-polyarc-fit-tol* (* radius *db-circle-radius-tol*)))
+          (setq max-error 0.0)
+          (foreach p arcpts
+            (setq error (abs (- (db:distance center p) radius)))
+            (if (> error max-error) (setq max-error error))
+          )
+          (setq valid (<= max-error tol))
+          (setq direction nil)
+          (setq total 0.0)
+          (setq i 0)
+          (while (and valid (< i (1- n)))
+            (setq p (nth i arcpts))
+            (setq q (nth (1+ i) arcpts))
+            (setq step (db:signed-angle (db:sub p center) (db:sub q center)))
+            (if (<= (abs step) *db-eps*)
+              (setq valid nil)
+              (progn
+                (setq step-sign (if (> step 0.0) 1.0 -1.0))
+                (if (not direction)
+                  (setq direction step-sign)
+                  (if (/= step-sign direction) (setq valid nil))
+                )
+                (setq total (+ total step))
+              )
+            )
+            (setq i (1+ i))
+          )
+          (if (and valid direction (> (abs total) *db-eps*) (< (abs total) (* 2.0 pi)))
+            (list
+              (cons 'center center)
+              (cons 'radius radius)
+              (cons 'direction direction)
+              (cons 'start-angle (db:angle (db:sub first center)))
+              (cons 'end-angle (db:angle (db:sub last center)))
+              (cons 'sweep (abs total))
+              (cons 'max-error max-error)
+            )
+            nil
+          )
+        )
+        nil
+      )
+    )
+  )
+)
+
+(defun db:polyarc-tangent-forward (fit pt / radial)
+  (setq radial (db:norm (db:sub pt (cdr (assoc 'center fit)))))
+  (if radial
+    (if (> (cdr (assoc 'direction fit)) 0.0)
+      (db:left-normal radial)
+      (db:right-normal radial)
+    )
+    nil
+  )
 )
 
 (defun db:ensure-layer (/ layer-def)
@@ -274,6 +420,24 @@
   (setq d2 (db:distance mid2 corner))
   (setq chosen (if (< d1 d2) ang alt))
   (db:tan (/ chosen 4.0))
+)
+
+(defun db:arc-bulge-with-start-tangent (center radius start end start-tangent / radial desired ang alt tangent1 tangent2 score1 score2 chosen)
+  (setq radial (db:norm (db:sub start center)))
+  (setq desired (db:norm start-tangent))
+  (if (and radial desired)
+    (progn
+      (setq ang (db:signed-angle (db:sub start center) (db:sub end center)))
+      (setq alt (if (> ang 0.0) (- ang (* 2.0 pi)) (+ ang (* 2.0 pi))))
+      (setq tangent1 (if (> ang 0.0) (db:left-normal radial) (db:right-normal radial)))
+      (setq tangent2 (if (> alt 0.0) (db:left-normal radial) (db:right-normal radial)))
+      (setq score1 (db:dot tangent1 desired))
+      (setq score2 (db:dot tangent2 desired))
+      (setq chosen (if (>= score1 score2) ang alt))
+      (db:tan (/ chosen 4.0))
+    )
+    (db:arc-bulge-near-corner center radius start end start)
+  )
 )
 
 (defun db:make-circle-on-layer (layer center radius)
@@ -533,6 +697,360 @@
     )
     nil
   )
+)
+
+(defun db:polyarc-run-forward (pts start / n count limit indices arcpts fit best)
+  (setq n (length pts))
+  (setq limit (min (- n 2) *db-polyarc-max-vertices*))
+  (setq count *db-polyarc-min-vertices*)
+  (setq best nil)
+  (while (<= count limit)
+    (setq indices (db:indices-forward start count n))
+    (setq arcpts (db:points-for-indices pts indices))
+    (setq fit (db:fit-polyarc-points arcpts))
+    (if fit
+      (setq best (list indices fit arcpts))
+      (if best (setq count limit))
+    )
+    (setq count (1+ count))
+  )
+  best
+)
+
+(defun db:polyarc-run-ending-at (pts end / n count limit start indices arcpts fit best)
+  (setq n (length pts))
+  (setq limit (min (- n 2) *db-polyarc-max-vertices*))
+  (setq count *db-polyarc-min-vertices*)
+  (setq best nil)
+  (while (<= count limit)
+    (setq start (+ (- end count) 1))
+    (setq indices (db:indices-forward start count n))
+    (setq arcpts (db:points-for-indices pts indices))
+    (setq fit (db:fit-polyarc-points arcpts))
+    (if fit
+      (setq best (list indices fit arcpts))
+      (if best (setq count limit))
+    )
+    (setq count (1+ count))
+  )
+  best
+)
+
+(defun db:indices-after-member (target indices / after result idx)
+  (setq after nil)
+  (setq result '())
+  (foreach idx indices
+    (if after
+      (setq result (cons idx result))
+    )
+    (if (= idx target)
+      (setq after T)
+    )
+  )
+  (reverse result)
+)
+
+(defun db:line-polyarc-bisector-center (corner dir-a dir-b radius / u v bisector)
+  (setq u (db:norm dir-a))
+  (setq v (db:norm dir-b))
+  (if (and u v)
+    (progn
+      (setq bisector (db:norm (db:add u v)))
+      (if bisector
+        (db:add corner (db:mul bisector radius))
+        nil
+      )
+    )
+    nil
+  )
+)
+
+(defun db:circle-segment-intersections (center radius a b / dir len f qb qc disc root s1 s2 params result param clamped pt duplicate existing)
+  (setq dir (db:norm (db:sub b a)))
+  (setq len (db:distance a b))
+  (setq result '())
+  (if (and dir (> len *db-eps*))
+    (progn
+      (setq f (db:sub a center))
+      (setq qb (* 2.0 (db:dot dir f)))
+      (setq qc (- (db:dot f f) (* radius radius)))
+      (setq disc (- (* qb qb) (* 4.0 qc)))
+      (if (>= disc (- *db-eps*))
+        (progn
+          (if (< disc 0.0) (setq disc 0.0))
+          (setq root (sqrt disc))
+          (setq s1 (/ (- (- qb) root) 2.0))
+          (setq s2 (/ (+ (- qb) root) 2.0))
+          (setq params (if (< s1 s2) (list s1 s2) (list s2 s1)))
+          (foreach param params
+            (if (and (>= param (- *db-duplicate-tol*)) (<= param (+ len *db-duplicate-tol*)))
+              (progn
+                (setq clamped (db:clamp param 0.0 len))
+                (setq pt (db:add a (db:mul dir clamped)))
+                (setq duplicate nil)
+                (foreach existing result
+                  (if (<= (db:distance pt (cdr (assoc 'point existing))) *db-duplicate-tol*)
+                    (setq duplicate T)
+                  )
+                )
+                (if (not duplicate)
+                  (setq result
+                    (append
+                      result
+                      (list
+                        (list
+                          (cons 'point pt)
+                          (cons 'param clamped)
+                          (cons 'segment-length len)
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  result
+)
+
+(defun db:circle-line-noncorner-intersection (center radius line-a line-b corner / hits hit pt dist best best-dist)
+  (setq best nil)
+  (setq best-dist nil)
+  (setq hits (db:circle-segment-intersections center radius line-a line-b))
+  (foreach hit hits
+    (setq pt (cdr (assoc 'point hit)))
+    (setq dist (db:distance pt corner))
+    (if (and
+          (> dist *db-duplicate-tol*)
+          (or (not best-dist) (< dist best-dist))
+        )
+      (progn
+        (setq best hit)
+        (setq best-dist dist)
+      )
+    )
+  )
+  (if best (cdr (assoc 'point best)) nil)
+)
+
+(defun db:indices-through-position (indices pos / i result)
+  (setq i 0)
+  (setq result '())
+  (while (and (< i (length indices)) (<= i pos))
+    (setq result (cons (nth i indices) result))
+    (setq i (1+ i))
+  )
+  (reverse result)
+)
+
+(defun db:circle-polyarc-forward-intersection (center radius pts indices corner / result i current next p q hits hit pt dist param seg-len skip-pos)
+  (setq result nil)
+  (setq i 0)
+  (while (and (not result) (< i (1- (length indices))))
+    (setq current (nth i indices))
+    (setq next (nth (1+ i) indices))
+    (setq p (nth current pts))
+    (setq q (nth next pts))
+    (setq hits (db:circle-segment-intersections center radius p q))
+    (foreach hit hits
+      (if (not result)
+        (progn
+          (setq pt (cdr (assoc 'point hit)))
+          (setq dist (db:distance pt corner))
+          (if (> dist *db-duplicate-tol*)
+            (progn
+              (setq param (cdr (assoc 'param hit)))
+              (setq seg-len (cdr (assoc 'segment-length hit)))
+              (setq skip-pos (if (>= param (- seg-len *db-duplicate-tol*)) (1+ i) i))
+              (setq result
+                (list
+                  (cons 'point pt)
+                  (cons 'skip-indices (db:indices-through-position indices skip-pos))
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+    (setq i (1+ i))
+  )
+  result
+)
+
+(defun db:circle-polyarc-backward-intersection (center radius pts indices corner / result i current next p q hits hit pt dist param source-index)
+  (setq result nil)
+  (setq i (- (length indices) 2))
+  (while (and (not result) (>= i 0))
+    (setq current (nth i indices))
+    (setq next (nth (1+ i) indices))
+    (setq p (nth current pts))
+    (setq q (nth next pts))
+    (setq hits (reverse (db:circle-segment-intersections center radius p q)))
+    (foreach hit hits
+      (if (not result)
+        (progn
+          (setq pt (cdr (assoc 'point hit)))
+          (setq dist (db:distance pt corner))
+          (if (> dist *db-duplicate-tol*)
+            (progn
+              (setq param (cdr (assoc 'param hit)))
+              (setq source-index (if (<= param *db-duplicate-tol*) current next))
+              (setq result
+                (list
+                  (cons 'point pt)
+                  (cons 'source-index source-index)
+                  (cons 'skip-indices (db:indices-after-member source-index indices))
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+    (setq i (1- i))
+  )
+  result
+)
+
+(defun db:create-line-polyarc-c-patch (verts idx area is-hole radius
+                                       / pts n corner dup-index line-a line-b arc-run arc-indices
+                                         fit arcpts arc-tangent line-back line-forward relief-dir pseudo-p2
+                                         center start source-hit end bulge angle skip)
+  (setq pts (db:vertex-points verts))
+  (setq n (length pts))
+  (setq corner (nth idx pts))
+  (setq dup-index (db:wrap-index (1+ idx) n))
+  (if (and
+        (db:same-point-p corner (nth dup-index pts) *db-duplicate-tol*)
+        (> n (+ *db-polyarc-min-vertices* 3))
+      )
+    (progn
+      (setq line-a (nth (db:wrap-index (1- idx) n) pts))
+      (setq line-b corner)
+      (setq arc-run (db:polyarc-run-forward pts dup-index))
+      (if arc-run
+        (progn
+          (setq arc-indices (car arc-run))
+          (setq fit (cadr arc-run))
+          (setq arcpts (caddr arc-run))
+          (setq arc-tangent (db:polyarc-tangent-forward fit corner))
+          (setq line-back (db:norm (db:sub line-a corner)))
+          (setq line-forward (db:norm (db:sub corner line-a)))
+          (setq relief-dir (if (and arc-tangent line-back) (db:norm (db:add line-back arc-tangent)) nil))
+          (setq pseudo-p2 (if arc-tangent (db:add corner arc-tangent) nil))
+          (if (and
+                relief-dir
+                pseudo-p2
+                (db:needs-dogbone line-a corner pseudo-p2 area is-hole)
+              )
+            (progn
+              (setq center (db:line-polyarc-bisector-center corner line-back arc-tangent radius))
+              (setq start (if center (db:circle-line-noncorner-intersection center radius line-a line-b corner) nil))
+              (setq source-hit (if center (db:circle-polyarc-forward-intersection center radius pts arc-indices corner) nil))
+              (if (and start source-hit)
+                (progn
+                  (setq end (cdr (assoc 'point source-hit)))
+                  (setq skip (cdr (assoc 'skip-indices source-hit)))
+                  (setq bulge (db:arc-bulge-with-start-tangent center radius start end line-forward))
+                  (setq angle (db:acos (db:dot line-back arc-tangent)))
+                  (append
+                    (db:make-production-patch "circle-line-polyarc" idx corner center start end radius bulge angle "C Line-Arc")
+                    (list (cons 'skip-indices skip))
+                  )
+                )
+                nil
+              )
+            )
+            nil
+          )
+        )
+        nil
+      )
+    )
+    nil
+  )
+)
+
+(defun db:create-polyarc-line-c-patch (verts idx area is-hole radius
+                                       / pts n corner dup-index line-a line-b arc-run arc-indices
+                                         fit arcpts arc-tangent line-forward relief-dir pseudo-p0
+                                         center source-hit start end bulge angle source-forward source-index skip)
+  (setq pts (db:vertex-points verts))
+  (setq n (length pts))
+  (setq corner (nth idx pts))
+  (setq dup-index (db:wrap-index (1+ idx) n))
+  (if (and
+        (db:same-point-p corner (nth dup-index pts) *db-duplicate-tol*)
+        (> n (+ *db-polyarc-min-vertices* 3))
+      )
+    (progn
+      (setq line-a corner)
+      (setq line-b (nth (db:wrap-index (+ idx 2) n) pts))
+      (setq arc-run (db:polyarc-run-ending-at pts idx))
+      (if arc-run
+        (progn
+          (setq arc-indices (car arc-run))
+          (setq fit (cadr arc-run))
+          (setq arcpts (caddr arc-run))
+          (setq arc-tangent (db:polyarc-tangent-forward fit corner))
+          (setq line-forward (db:norm (db:sub line-b corner)))
+          (setq pseudo-p0 (if arc-tangent (db:sub corner arc-tangent) nil))
+          (setq relief-dir
+            (if (and arc-tangent line-forward)
+              (db:norm (db:add (db:mul arc-tangent -1.0) line-forward))
+              nil
+            )
+          )
+          (if (and
+                relief-dir
+                pseudo-p0
+                (db:needs-dogbone pseudo-p0 corner line-b area is-hole)
+              )
+            (progn
+              (setq center (db:line-polyarc-bisector-center corner (db:mul arc-tangent -1.0) line-forward radius))
+              (setq source-hit (if center (db:circle-polyarc-backward-intersection center radius pts arc-indices corner) nil))
+              (setq end (if center (db:circle-line-noncorner-intersection center radius line-a line-b corner) nil))
+              (if (and source-hit end)
+                (progn
+                  (setq start (cdr (assoc 'point source-hit)))
+                  (setq source-index (cdr (assoc 'source-index source-hit)))
+                  (setq skip (append (cdr (assoc 'skip-indices source-hit)) (list dup-index)))
+                  (setq source-forward (db:polyarc-tangent-forward fit start))
+                  (setq bulge (db:arc-bulge-with-start-tangent center radius start end source-forward))
+                  (setq angle (db:acos (db:dot (db:mul arc-tangent -1.0) line-forward)))
+                  (append
+                    (db:make-production-patch "circle-polyarc-line" source-index corner center start end radius bulge angle "C Arc-Line")
+                    (list (cons 'skip-indices skip))
+                  )
+                )
+                nil
+              )
+            )
+            nil
+          )
+        )
+        nil
+      )
+    )
+    nil
+  )
+)
+
+(defun db:find-polyarc-line-c-patch (verts idx area is-hole radius / patch)
+  (setq patch (db:create-line-polyarc-c-patch verts idx area is-hole radius))
+  (if (not patch)
+    (setq patch (db:create-polyarc-line-c-patch verts idx area is-hole radius))
+  )
+  patch
+)
+
+(defun db:polyarc-line-candidate-p (verts idx area is-hole)
+  (if (db:find-polyarc-line-c-patch verts idx area is-hole (db:radius)) T nil)
 )
 
 ;;; Phase 0 Mode A: offset-center circle tangent to both corner edges.
@@ -1295,9 +1813,12 @@
 )
 
 (defun db:auto-corner-candidate-p (verts idx p0 p1 p2 area is-hole)
-  (and
-    (db:sharp-corner-p verts idx)
-    (db:needs-dogbone p0 p1 p2 area is-hole)
+  (or
+    (and
+      (db:sharp-corner-p verts idx)
+      (db:needs-dogbone p0 p1 p2 area is-hole)
+    )
+    (db:polyarc-line-candidate-p verts idx area is-hole)
   )
 )
 
@@ -1311,16 +1832,34 @@
   (if found (cdr found) 0.0)
 )
 
-(defun db:attach-source-bulges (patch verts idx / n prev-bulge this-bulge)
+(defun db:patch-skip-indices (patch / found)
+  (setq found (assoc 'skip-indices patch))
+  (if found (cdr found) '())
+)
+
+(defun db:patch-skips-index-p (idx patches / found p)
+  (setq found nil)
+  (foreach p patches
+    (if (db:list-has-int idx (db:patch-skip-indices p))
+      (setq found T)
+    )
+  )
+  found
+)
+
+(defun db:attach-source-bulges (patch verts idx / n source-index prev-bulge this-bulge)
   (setq n (length verts))
-  (setq prev-bulge (db:vertex-bulge verts (rem (+ idx n -1) n)))
-  (setq this-bulge (db:vertex-bulge verts idx))
   (if patch
-    (append
-      patch
-      (list
-        (cons 'before-bulge prev-bulge)
-        (cons 'after-bulge this-bulge)
+    (progn
+      (setq source-index (db:assoc-value 'source-index patch idx))
+      (setq prev-bulge (db:vertex-bulge verts (db:wrap-index (1- source-index) n)))
+      (setq this-bulge (db:vertex-bulge verts source-index))
+      (append
+        patch
+        (list
+          (cons 'before-bulge prev-bulge)
+          (cons 'after-bulge this-bulge)
+        )
       )
     )
   )
@@ -1403,6 +1942,15 @@
   )
 )
 
+(defun db:create-auto-patch (verts idx p0 p1 p2 area is-hole / r patch)
+  (setq r (db:radius))
+  (setq patch (db:find-polyarc-line-c-patch verts idx area is-hole r))
+  (if (not patch)
+    (setq patch (db:create-patch p0 p1 p2 idx))
+  )
+  patch
+)
+
 (defun db:build-patches (item existing / pts area is-hole verts n i p0 p1 p2 patch patches corners dupes failed)
   (setq pts (cadr item))
   (setq area (caddr item))
@@ -1424,7 +1972,7 @@
         (if (db:auto-corner-candidate-p verts i p0 p1 p2 area is-hole)
           (progn
             (setq corners (1+ corners))
-            (setq patch (db:create-patch p0 p1 p2 i))
+            (setq patch (db:create-auto-patch verts i p0 p1 p2 area is-hole))
             (setq patch (db:attach-source-bulges patch verts i))
             (if patch
               (if (db:duplicate-patch-p patch (append existing patches) *db-duplicate-tol*)
@@ -1450,8 +1998,11 @@
   (while (< i n)
     (setq patch (db:find-patch i patches))
     (setq next-patch (db:find-patch (rem (1+ i) n) patches))
-    (if patch
-      (progn
+    (cond
+      ((db:patch-skips-index-p i patches)
+        nil
+      )
+      (patch
         (setq vertices
           (append
             vertices
@@ -1462,13 +2013,15 @@
           )
         )
       )
-      (setq vertices
-        (append
-          vertices
-          (list
+      (T
+        (setq vertices
+          (append
+            vertices
             (list
-              (car (nth i verts))
-              (if next-patch (db:patch-before-bulge next-patch) (cadr (nth i verts)))
+              (list
+                (car (nth i verts))
+                (if next-patch (db:patch-before-bulge next-patch) (cadr (nth i verts)))
+              )
             )
           )
         )
